@@ -1,0 +1,5 @@
+Café menu
+
+Croissant ........ 3.20 €
+Café crème ....... 2.80 €
+Thé à la menthe .. 2.50 €

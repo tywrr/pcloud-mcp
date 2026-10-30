@@ -1,0 +1,79 @@
+// pcloud-mcp: the public OAuth front of the pCloud MCP server.
+//
+// It is the URL you add to Claude as a custom connector (https://<this Worker>/mcp). It signs
+// Claude in (OAuth 2.1 with PKCE, Client ID Metadata Documents or Dynamic Client Registration),
+// and forwards authorized /mcp requests to the Rust Worker "pcloud-mcp-core" over a service
+// binding, which has no public URL of its own.
+//
+// Secrets (set with `npx wrangler secret put NAME`, never in this file; locally in .dev.vars):
+//   INTERNAL_TOKEN    the same value as the core Worker's INTERNAL_TOKEN. The core accepts only
+//                     requests that carry it, so Claude's own access tokens never reach it.
+//   OWNER_PASSPHRASE  what you type on the sign-in page. Use a long random one, for example
+//                     the output of `openssl rand -base64 24`; anyone who knows it can connect.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "pcloud-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-10-23",
+	// Client ID Metadata Documents make this Worker fetch a URL the client names. The flag keeps
+	// those fetches on the public internet (SSRF protection); without it the OAuth library turns
+	// CIMD off and Claude falls back to Dynamic Client Registration.
+	"compatibility_flags": ["global_fetch_strictly_public"],
+	// One public URL. Preview URLs would be extra hostnames that also serve the sign-in page.
+	"workers_dev": true,
+	"preview_urls": false,
+	"observability": { "enabled": true },
+	"vars": {
+		// The public origin of this Worker, without a trailing slash, for example
+		// "https://pcloud-mcp.example.workers.dev". The protected resource ("<PUBLIC_URL>/mcp")
+		// must equal the URL you enter in Claude exactly. Leave it empty to use the origin each
+		// request arrives on, which is right unless the Worker answers on several hostnames.
+		"PUBLIC_URL": "",
+		// Where sign-in codes may be sent, comma-separated: exact redirect URIs, plus the keyword
+		// "loopback" for http://localhost and http://127.0.0.1 on any port and path (Claude Code,
+		// MCP Inspector). Dynamic registration lets anyone register a client, so this list, not
+		// the client, decides where your access can go.
+		"ALLOWED_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback,loopback",
+		// Who may register a client (POST /register), comma-separated CIDRs or "*" for everyone.
+		// Every registration is a KV write, so by default only loopback (wrangler dev) may. Claude
+		// and Claude Code identify themselves with Client ID Metadata Documents and don't register.
+		// If claude.ai ever falls back to registering, add Anthropic's range, 160.79.104.0/21
+		// (anyone using Claude can send requests from it, so it isn't on by default). To connect a
+		// client that registers itself from your computer, such as the MCP Inspector, add your
+		// address for a moment, or "*".
+		"DCR_ALLOWED_CIDRS": "127.0.0.0/8,::1"
+	},
+	// Wrangler refuses to deploy without these, and warns in `wrangler dev` when .dev.vars lacks
+	// them. A brand-new Worker can't have secrets yet, so the first deploy passes them in a file:
+	// `npx wrangler deploy --secrets-file .secrets` (see README.md).
+	"secrets": { "required": ["INTERNAL_TOKEN", "OWNER_PASSPHRASE"] },
+	// Clients, grants and tokens (tokens are stored only as hashes). With no "id", wrangler
+	// creates the namespace on the first deploy and keeps it linked.
+	"kv_namespaces": [{ "binding": "OAUTH_KV" }],
+	"services": [
+		// The Rust Worker that serves the MCP tools. It must be deployed first.
+		{ "binding": "MCP_CORE", "service": "pcloud-mcp-core" }
+	],
+	// Approximate per-IP limits (an IPv6 caller's whole /64 counts as one address), counted
+	// separately in each Cloudflare location. They slow down passphrase guessing and floods; a
+	// long passphrase is what actually keeps people out. They don't guard the free plan's 1,000 KV
+	// writes a day: anonymous requests don't write to KV at all (the sign-in page stores nothing,
+	// only DCR_ALLOWED_CIDRS may register, and /token refuses client assertions). namespace_id is
+	// any number that is unique in your account.
+	"ratelimits": [
+		{
+			// Passphrase attempts on the sign-in page.
+			"name": "PASSPHRASE_LIMITER",
+			"namespace_id": "73101",
+			"simple": { "limit": 5, "period": 60 }
+		},
+		{
+			// Sign-in page views and denials (each reads KV or fetches a client metadata document),
+			// and client registrations.
+			"name": "SIGNIN_LIMITER",
+			"namespace_id": "73102",
+			"simple": { "limit": 20, "period": 60 }
+		}
+	],
+	"dev": { "port": 8788 }
+}

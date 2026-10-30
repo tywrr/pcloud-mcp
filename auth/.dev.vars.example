@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `npm run dev`. Local values only; production secrets are set with
+# `npx wrangler secret put INTERNAL_TOKEN` and `npx wrangler secret put OWNER_PASSPHRASE`.
+INTERNAL_TOKEN=dev-internal-token
+OWNER_PASSPHRASE=dev-passphrase
+# Vars from wrangler.jsonc can be overridden here too. The default DCR_ALLOWED_CIDRS already lets
+# loopback register clients, which is where local requests come from.
+# DCR_ALLOWED_CIDRS=*

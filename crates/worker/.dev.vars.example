@@ -1,0 +1,7 @@
+# Local development values. Copy to .dev.vars (git-ignored); `wrangler dev` reads it.
+# INTERNAL_TOKEN must match auth/.dev.vars, and the backend values must match
+# scripts/dev-backend.sh (RCLONE_USER / RCLONE_PASS).
+INTERNAL_TOKEN=dev-internal-token
+BACKEND_URL=http://127.0.0.1:8081
+BACKEND_USER=mcp
+BACKEND_PASSWORD=dev-password

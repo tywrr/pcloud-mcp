@@ -1,0 +1,16 @@
+[package]
+name = "pcloud-mcp-core"
+description = "MCP (Model Context Protocol) server logic and file tools for pcloud-mcp, independent of the storage backend and runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pollster = "0.4.0"

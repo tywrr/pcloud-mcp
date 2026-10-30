@@ -1,0 +1,17 @@
+[package]
+name = "pcloud-mcp-worker"
+description = "Cloudflare Worker (workers-rs) that serves the pcloud-mcp MCP endpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pcloud-mcp-core.workspace = true
+pcloud-mcp-webdav.workspace = true
+subtle.workspace = true
+worker.workspace = true

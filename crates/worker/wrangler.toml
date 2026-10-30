@@ -1,0 +1,63 @@
+# The Rust half of pcloud-mcp: the MCP endpoint itself. It is never reachable from the
+# internet (no workers.dev URL, no preview URLs, no routes). The OAuth front, the "pcloud-mcp"
+# Worker in auth/, calls it through a service binding and adds the internal token.
+name = "pcloud-mcp-core"
+# worker-build 0.8 writes a bundled ES module here (build/worker/shim.mjs is only a
+# backwards-compatible alias for it).
+main = "build/index.js"
+compatibility_date = "2026-10-29"
+workers_dev = false
+preview_urls = false
+
+[build]
+# Compiles to wasm32, runs wasm-bindgen and wasm-opt, and writes build/. Install the tool with
+# `cargo install worker-build@0.8.7`; keep it in step with the `worker` crate's version.
+command = "worker-build --release"
+
+[dev]
+port = 8787
+
+# Workers Logs: request logs plus console output (panics, backend failures, refused tokens).
+[observability]
+enabled = true
+
+[vars]
+# rclone's Basic auth user (RCLONE_USER on the laptop).
+BACKEND_USER = "mcp"
+# Optional, all unset by default (the values shown are the defaults):
+# ALLOWED_ORIGINS = "https://example.com"  # comma-separated origins allowed in an Origin header
+#                                          # besides https://claude.ai and https://claude.com,
+#                                          # which always are; other origins get 403 (logged)
+#                                          # and requests without the header are allowed
+# MAX_READ_BYTES = "100000"                # most bytes read_text_file returns per call
+# MAX_IMAGE_BYTES = "1572864"              # largest image read_image returns (1.5 MiB)
+# SEARCH_LIMIT = "50"                      # most results search_files returns
+# MAX_LISTING_BYTES = "400000"             # largest WebDAV listing list_folder and search_files
+#                                          # go through (about 1,000 entries); past it they ask
+#                                          # for a narrower path. Raise it, or MAX_IMAGE_BYTES,
+#                                          # only on the paid plan: parsing and encoding are the
+#                                          # main CPU costs, and the free plan allows 10 ms
+
+# Secrets, set with `wrangler secret put NAME` (and in .dev.vars for local development):
+#   INTERNAL_TOKEN    required; the same value as the auth front's INTERNAL_TOKEN
+#   BACKEND_PASSWORD  rclone's Basic auth password (RCLONE_PASS on the laptop)
+#
+# BACKEND_URL is for local development only and lives in .dev.vars: when it is set, the Worker
+# fetches rclone at that URL directly (http://127.0.0.1:8081, scripts/dev-backend.sh) and
+# ignores the PCLOUD_BACKEND binding below.
+
+# How production reaches rclone on the laptop: a Workers VPC Service in front of the
+# cloudflared tunnel. Create the tunnel in the dashboard (Workers VPC > Tunnels), run
+# cloudflared on the laptop with --protocol quic, then create the service and paste its ID:
+#
+#   wrangler vpc service create pcloud-laptop --type http --tunnel-id <TUNNEL_ID> --ipv4 127.0.0.1 --http-port 8080
+#
+# Once it is filled in, leave the block uncommented for local work too. VPC Services have no
+# local simulation, so with `remote = true` plain `wrangler dev` connects the binding to the
+# real tunnel (that needs `wrangler login`); `wrangler dev --local` turns remote bindings off
+# and needs no login. Either way BACKEND_URL wins while .dev.vars sets it; drop it from there
+# to try the tunnel.
+# [[vpc_services]]
+# binding = "PCLOUD_BACKEND"
+# service_id = "<SERVICE_ID>"
+# remote = true
