@@ -12,9 +12,6 @@ base64.workspace = true
 httpdate.workspace = true
 percent-encoding.workspace = true
 quick-xml.workspace = true
-# NFD for accent-insensitive search. The Worker already links it (url's IDNA support uses
-# it), so this adds only about 11 kB to the gzipped wasm.
-icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
 
 [dev-dependencies]
 pollster.workspace = true

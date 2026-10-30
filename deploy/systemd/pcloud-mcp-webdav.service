@@ -1,6 +1,6 @@
-# Serves one folder of the pCloud Drive mount read-only over WebDAV on 127.0.0.1:8080, where the
-# Cloudflare Tunnel (pcloud-mcp-tunnel.service) picks it up. Nothing else can reach it. The local
-# development backend (scripts/dev-backend.sh) uses 8081, so the two can run side by side.
+# Serves a folder of the pCloud Drive mount, or all of it, read-only over WebDAV on 127.0.0.1:8080,
+# where the Cloudflare Tunnel (pcloud-mcp-tunnel.service) picks it up. Nothing else can reach it.
+# The local development backend (scripts/dev-backend.sh) uses 8081, so the two can run side by side.
 #
 # Install (docs/setup.md, step 3):
 #   cp deploy/systemd/pcloud-mcp-*.service ~/.config/systemd/user/
@@ -11,7 +11,12 @@
 #   RCLONE_USER=mcp                                      Basic auth user; the core Worker's BACKEND_USER
 #   RCLONE_PASS=<openssl rand -hex 24>                   Basic auth password; its BACKEND_PASSWORD secret
 #   PCLOUD_MCP_DIR=/home/you/pCloudDrive/Library         the folder Claude may read (absolute path)
-# rclone reads RCLONE_USER and RCLONE_PASS itself, so the password never shows up in `ps`.
+# and, to serve the whole drive (PCLOUD_MCP_DIR=/home/you/pCloudDrive) without the Crypto Folder:
+#   RCLONE_FILTER_FROM=/home/you/.config/pcloud-mcp/rclone-filter.txt   what to hide, from
+#                                                        deploy/rclone-filter.txt (docs/setup.md,
+#                                                        "Serving the whole drive")
+# rclone reads RCLONE_USER, RCLONE_PASS and RCLONE_FILTER_FROM itself (any flag can come from an
+# RCLONE_* variable), so the password never shows up in `ps` and the filter needs no flag here.
 
 [Unit]
 Description=pcloud-mcp: read-only WebDAV over a pCloud Drive folder

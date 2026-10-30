@@ -5,7 +5,8 @@
 
 use pcloud_mcp_webdav::{Transport, TransportRequest, TransportResponse};
 use worker::wasm_bindgen::{JsCast, JsValue};
-use worker::{Env, Fetch, Fetcher, js_sys, web_sys};
+use worker::wasm_bindgen_futures::JsFuture;
+use worker::{Env, Fetch, Fetcher, ResponseBody, js_sys, web_sys};
 
 /// The VPC Service decides where requests go; the URL only supplies the path and the Host
 /// header (rclone ignores Host).
@@ -112,11 +113,15 @@ impl Transport for Backend {
         })?;
         let status = response.status_code();
         let headers = response.headers().entries().collect();
-        let body = response.bytes().await.map_err(|e| e.to_string())?;
+        let (body, truncated) = match request.max_response_bytes {
+            Some(max) => read_at_most(response.body(), max).await.map_err(js_error)?,
+            None => (response.bytes().await.map_err(|e| e.to_string())?, false),
+        };
         Ok(TransportResponse {
             status,
             headers,
             body,
+            truncated,
         })
     }
 
@@ -143,6 +148,42 @@ fn build_request(url: &str, request: &TransportRequest) -> Result<worker::Reques
     }
     let js_request = web_sys::Request::new_with_str_and_init(url, &init)?;
     Ok(worker::Request::from(js_request))
+}
+
+/// Reads a body chunk by chunk, keeping at most `max` bytes. Once it is longer, the stream is
+/// cancelled, which drops the connection through the tunnel: rclone stops sending a listing
+/// nobody will parse (a big tree's runs to tens of megabytes), and the Worker never holds more
+/// than `max` bytes of it. `true` means the body was cut.
+async fn read_at_most(body: &ResponseBody, max: usize) -> Result<(Vec<u8>, bool), JsValue> {
+    let stream = match body {
+        ResponseBody::Stream(stream) => stream,
+        ResponseBody::Empty => return Ok((Vec::new(), false)),
+        ResponseBody::Body(bytes) => {
+            return Ok((bytes[..bytes.len().min(max)].to_vec(), bytes.len() > max));
+        }
+    };
+    let reader = web_sys::ReadableStreamDefaultReader::new(stream)?;
+    let mut out = Vec::new();
+    loop {
+        let result = JsFuture::from(reader.read()).await?;
+        if js_sys::Reflect::get(&result, &JsValue::from_str("done"))?.is_truthy() {
+            return Ok((out, false));
+        }
+        let chunk: js_sys::Uint8Array =
+            js_sys::Reflect::get(&result, &JsValue::from_str("value"))?.dyn_into()?;
+        let len = chunk.length() as usize;
+        let start = out.len();
+        let room = max - start;
+        if len > room {
+            out.resize(max, 0);
+            chunk.subarray(0, room as u32).copy_to(&mut out[start..]);
+            // The bytes that matter are in; a failed cancel changes nothing.
+            let _ = JsFuture::from(reader.cancel()).await;
+            return Ok((out, true));
+        }
+        out.resize(start + len, 0);
+        chunk.copy_to(&mut out[start..]);
+    }
 }
 
 fn js_error(value: JsValue) -> String {

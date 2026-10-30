@@ -1,0 +1,102 @@
+# The pcloud-mcp backend on Kubernetes: rclone serving pCloud read-only over WebDAV, and cloudflared
+# connecting the pod to the Cloudflare Tunnel that the core Worker's Workers VPC service points at.
+#
+# Both containers share the pod's network, so cloudflared reaches rclone at 127.0.0.1:8080: the same
+# address the VPC service was created with (docs/setup.md, step 6), and nothing listens on the pod IP.
+# rclone talks to pCloud's API with its own registered OAuth app, so no pCloud Drive mount is needed.
+#
+# Secret pcloud-mcp-backend (created by apply.sh, never committed) holds:
+#   pcloud-token, pcloud-hostname  from `rclone config create pcloud-mcp pcloud` on any machine
+#   webdav-password                rclone's Basic auth password, = the core Worker's BACKEND_PASSWORD
+#   tunnel-token                   the tunnel's eyJ... token
+#   filter.txt                     rclone filter rules (deploy/rclone-filter.txt)
+#
+# Run one replica only, and stop any other connector (the laptop's pcloud-mcp-tunnel) on the same
+# tunnel: Cloudflare spreads requests across every connector of a tunnel.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pcloud-mcp-backend
+  namespace: pcloud-mcp
+  labels: { app.kubernetes.io/name: pcloud-mcp-backend }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: pcloud-mcp-backend }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: pcloud-mcp-backend }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: rclone
+          image: rclone/rclone:1.75.2
+          args:
+            - serve
+            - webdav
+            - "pcloud:"
+            - --addr=127.0.0.1:8080
+            - --read-only
+            - --filter-from=/etc/pcloud-mcp/filter.txt
+            # Listings come from pCloud's API here, not a local mount, so cache them a little longer.
+            - --dir-cache-time=10m
+          env:
+            # The remote is defined entirely by env vars, so no rclone.conf is written or read.
+            - { name: RCLONE_CONFIG, value: /tmp/rclone.conf }
+            - { name: RCLONE_CACHE_DIR, value: /tmp/cache }
+            - { name: RCLONE_CONFIG_PCLOUD_TYPE, value: pcloud }
+            - name: RCLONE_CONFIG_PCLOUD_HOSTNAME
+              valueFrom: { secretKeyRef: { name: pcloud-mcp-backend, key: pcloud-hostname } }
+            - name: RCLONE_CONFIG_PCLOUD_TOKEN
+              valueFrom: { secretKeyRef: { name: pcloud-mcp-backend, key: pcloud-token } }
+            - { name: RCLONE_USER, value: mcp }
+            - name: RCLONE_PASS
+              valueFrom: { secretKeyRef: { name: pcloud-mcp-backend, key: webdav-password } }
+          volumeMounts:
+            - { name: filter, mountPath: /etc/pcloud-mcp, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.10.2
+          # --protocol quic: Workers VPC doesn't work over http2, the fallback "auto" would pick.
+          args: [tunnel, --no-autoupdate, --protocol, quic, run]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom: { secretKeyRef: { name: pcloud-mcp-backend, key: tunnel-token } }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+      volumes:
+        - name: filter
+          secret:
+            secretName: pcloud-mcp-backend
+            items: [{ key: filter.txt, path: filter.txt }]
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+---
+# Nothing needs to connect to this pod: cloudflared dials out, and rclone listens on loopback only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-ingress
+  namespace: pcloud-mcp
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]

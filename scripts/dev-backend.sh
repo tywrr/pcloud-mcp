@@ -11,6 +11,8 @@
 #   BACKEND_ADDR  Address to listen on (default 127.0.0.1:8081, which matches
 #                 crates/worker/.dev.vars.example). Keep it on loopback. The production rclone
 #                 (deploy/systemd) listens on 8080, so both can run on one machine.
+#   RCLONE_FILTER_FROM  Optional filter file of what to hide (absolute path), as on the laptop:
+#                 RCLONE_FILTER_FROM=$PWD/deploy/rclone-filter.txt scripts/dev-backend.sh DIR
 #
 # rclone reads RCLONE_USER and RCLONE_PASS itself, so the password never appears in `ps`.
 set -euo pipefail

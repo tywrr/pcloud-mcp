@@ -6,7 +6,7 @@ What you end up with:
 
 | Piece | Where | Name |
 |---|---|---|
-| WebDAV server over one pCloud Drive folder | Laptop, `systemd --user` | `pcloud-mcp-webdav.service` |
+| WebDAV server over one pCloud Drive folder, or all of it | Laptop, `systemd --user` | `pcloud-mcp-webdav.service` |
 | Tunnel connector | Laptop, `systemd --user` | `pcloud-mcp-tunnel.service` |
 | Cloudflare Tunnel, no public hostname | Cloudflare | `pcloud-laptop` (your choice) |
 | Workers VPC service | Cloudflare | `pcloud-laptop` (your choice) |
@@ -20,6 +20,7 @@ And these files on the laptop, all in `~/.config/pcloud-mcp/` (mode 700):
 | File | Holds |
 |---|---|
 | `webdav.env` | rclone's Basic auth user and password, and the folder to serve |
+| `rclone-filter.txt` | Optional: what rclone hides when it serves the whole drive |
 | `tunnel-token` | The tunnel token |
 | `core.secrets` | The core Worker's secrets, for its first deploy |
 | `auth.secrets` | The auth Worker's secrets, for its first deploy |
@@ -59,10 +60,67 @@ Pick **one folder** under `~/pCloudDrive` for Claude to read. Everything in it, 
 
 - **Not the Crypto Folder.** It's unreadable while locked, so rclone gets "permission denied", and it's the wrong place for this anyway.
 - **Not a folder with secrets**: IDs, tax papers, bank statements, password exports.
-- **Not the whole drive** unless you really mean it.
+- **Not the whole drive** unless you really mean it. If you do, read [Serving the whole drive](#serving-the-whole-drive) first: it hides the Crypto Folder and keeps search working around huge folders.
 - **Small enough for the free plan.** A Worker on the free plan gets 10 ms of CPU per request, and parsing listings costs CPU. `search_files` stays under it up to roughly 1,000 files and folders under the path it searches (the whole folder by default), and `list_folder` up to roughly 1,000 to 1,500 entries in one folder; `read_image` takes images up to 1.5 MiB. A listing over `MAX_LISTING_BYTES` (400,000 bytes) fails cleanly, with a message telling Claude to narrow the path, so a bigger folder still works for the parts Claude can narrow down to. On Workers Paid ($5 a month, 30 s of CPU per request) you can serve more and raise `MAX_LISTING_BYTES` and `MAX_IMAGE_BYTES` ([configuration reference](#configuration-reference)).
 
 The examples below use `~/pCloudDrive/Library`. Spaces in the name are fine.
+
+### Serving the whole drive
+
+You can serve `~/pCloudDrive` itself instead of one folder. Then **everything in your pCloud is readable by anyone who has the passphrase, through Claude**, except what you hide with the filter below. Think about the IDs, tax papers and password exports you keep there before you do it.
+
+A bonus: with the drive root served, paths here match pCloud's own (`/Documents/lease.pdf` is `/Documents/lease.pdf` in both), so pCloud's [official connector](https://mcp.pcloud.com/mcp) pairs well with this one. It searches the whole drive on pCloud's side and manages files; this one reads what's inside them. Claude can find a file with one and read it with the other.
+
+It takes four changes on top of the steps below.
+
+**1. Point `PCLOUD_MCP_DIR` at the drive** when you write `webdav.env` in step 3: `PCLOUD_MCP_DIR=$HOME/pCloudDrive` in that snippet.
+
+**2. Hide what Claude shouldn't see** with an rclone filter file. [`deploy/rclone-filter.txt`](../deploy/rclone-filter.txt) hides the Crypto Folder (pCloud Drive shows its files in plain text whenever it's unlocked), desktop trash folders, `.DS_Store` and `.directory` files, and pCloud Drive's `/.pcloudicon.png`. Add your own rules to it; the comments in the file explain the syntax. rclone takes any of its flags from an `RCLONE_` environment variable, so `RCLONE_FILTER_FROM` in `webdav.env` is the `--filter-from` option, with no change to the unit. Once step 3 is done:
+
+```bash
+cp deploy/rclone-filter.txt ~/.config/pcloud-mcp/rclone-filter.txt
+echo "RCLONE_FILTER_FROM=$HOME/.config/pcloud-mcp/rclone-filter.txt" >> ~/.config/pcloud-mcp/webdav.env
+systemctl --user restart pcloud-mcp-webdav
+```
+
+The path must be absolute and the file must exist, or rclone won't start (it reads the variable as a comma-separated list, so the path can't contain a comma). Check that the Crypto Folder is gone from the listing:
+
+```bash
+curl -s -u "mcp:$(sed -n 's/^RCLONE_PASS=//p' ~/.config/pcloud-mcp/webdav.env)" \
+  -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8080/ | grep -o '<D:href>[^<]*</D:href>'
+```
+
+Hidden files are gone from listings, searches and reads alike: rclone answers `404` for them.
+
+**3. Turn search off in huge folders** with `SEARCH_SKIP`. `search_files` reads the whole tree under the path it searches in one WebDAV listing, and refuses when that's over `MAX_LISTING_BYTES` (about 1,000 entries; see step 2's numbers). A photo backup of 130,000 files means every search from `/` is refused. To find the big ones, count the entries in each top-level folder (this walks the mount, so give it a while):
+
+```bash
+for d in ~/pCloudDrive/*/; do printf '%8d  %s\n' "$(find "$d" | wc -l)" "$d"; done
+```
+
+List the folders search should stay out of, comma-separated, as paths from the root of what you serve. Set them as a secret, which keeps your folder names out of the public `wrangler.toml`:
+
+```bash
+(cd crates/worker && printf %s '/Backups/Immich' | wrangler secret put SEARCH_SKIP)
+```
+
+(A var in `crates/worker/wrangler.toml` works too; use one or the other, not both.) A secret takes effect at once; a var with the next deploy. Then:
+
+- A search at or inside a turned-off folder is refused with a message telling Claude to browse it with `list_folder` instead. `list_folder` still shows up to 1,000 entries per folder.
+- A search above one (from `/`, say) goes around it: it lists the folders on the way down to it, matches their names itself, and searches each other subfolder on its own. A subfolder that's still too big is left out with a note naming it, so Claude can search inside it with a narrower path; the rest of the results still come back. One search makes at most 40 of these lookups, and all of them together parse at most `MAX_LISTING_BYTES` and receive at most twice that (an answer too big to use still counts for what was read of it), so it stays within the free plan's CPU and subrequest limits.
+- The folder's own name still matches: searching for "immich" finds `/Backups/Immich`.
+
+**4. Write a guide for Claude.** If there's a file named `AGENTS.md` at the root of what you serve (`~/pCloudDrive/AGENTS.md`, so `/AGENTS.md` in any pCloud client), its first 8 KiB go into the instructions Claude gets when it connects. Say what each folder is for and where things live, so Claude doesn't have to explore to find out:
+
+```markdown
+# My pCloud
+
+- Documents/: scanned letters and contracts, by year
+- Projects/: one folder per project; each has a README.md
+- Backups/: machine backups. Backups/Immich is the photo library (130,000 files); browse it by year and month.
+```
+
+Edit it from anywhere, the web or the phone app included. Claude reads it again each time it connects to the server, so a change shows up in the next conversation (clients that cache the server's details may take up to an hour). A longer guide is cut at 8 KiB, with a note telling Claude to read the rest with `read_text_file`. `GUIDE_PATH` names another file; set it to the empty string (`GUIDE_PATH = ""` in `wrangler.toml`) to turn the guide off. The guide counts as the owner's word, so anyone who can change that file in your pCloud can steer what Claude does with the connector.
 
 ## 3. Serve it with rclone
 
@@ -315,7 +373,12 @@ The deployed core has no `PCLOUD_BACKEND` binding: the `[[vpc_services]]` block 
 
 ### "Permission denied" on some files
 
-That's the Crypto Folder (unreadable while locked) or a file pCloud Drive can't open. Serve a folder outside the Crypto Folder.
+That's the Crypto Folder (unreadable while locked) or a file pCloud Drive can't open. Serve a folder outside the Crypto Folder, or, when you serve the whole drive, hide it with the [filter file](#serving-the-whole-drive).
+
+### `search_files` says "turned off" or "too many entries"
+
+- **"Search is turned off under ..."**: the search path is at or inside a `SEARCH_SKIP` folder. That's on purpose; Claude can browse it with `list_folder`. To change the list, `wrangler secret put SEARCH_SKIP` again (or `wrangler secret delete SEARCH_SKIP`).
+- **"too many entries to go through at once"** for a search from `/`: a folder in the tree is too big to search in one call. Add it to `SEARCH_SKIP` ([Serving the whole drive](#serving-the-whole-drive)). Entries are matched against folder paths as `list_folder` shows them, ignoring case and accents, so copy the path from a listing. An entry that isn't a valid path (one with `..` or a control character in it) is ignored, and `wrangler tail pcloud-mcp-core` logs a warning naming it by position ("ignoring entry 2"); an entry that is valid but names no folder is ignored without a warning.
 
 ### Changes don't show up
 
@@ -410,8 +473,10 @@ Every approved connection (claude.ai, Claude Code, Inspector) is a grant in `OAU
 | `ALLOWED_ORIGINS` | Var | (none) | Comma-separated browser origins allowed to call `/mcp`, on top of `https://claude.ai` and `https://claude.com`, which are always allowed. Requests without an `Origin` header, like Claude's, always pass; others get `403` and are logged |
 | `MAX_READ_BYTES` | Var | `100000` | Most bytes per `read_text_file` call |
 | `MAX_IMAGE_BYTES` | Var | `1572864` (1.5 MiB) | Largest image `read_image` returns. The default keeps base64-encoding within the free plan's 10 ms of CPU; raise it on Workers Paid |
-| `MAX_LISTING_BYTES` | Var | `400000` | Largest WebDAV `PROPFIND` answer the core parses: one folder for `list_folder`, the whole tree under the path for `search_files`. A bigger one is a tool error telling Claude to narrow the path, rather than a CPU-limit failure; raise it on Workers Paid |
+| `MAX_LISTING_BYTES` | Var | `400000` | Most WebDAV `PROPFIND` answer bytes the core parses per request: one folder for `list_folder`, the whole tree under the path for `search_files` (or, around `SEARCH_SKIP` folders, all its subfolder searches together). The core stops reading rclone's answer there, so a bigger one costs no more, and stops asking once a request has received twice this much in all, unusable answers included. Past it, the tool error tells Claude to narrow the path, rather than the Worker running out of CPU; raise it on Workers Paid |
 | `SEARCH_LIMIT` | Var | `50` | Most results per `search_files` call |
+| `SEARCH_SKIP` | Secret or var | (none) | Comma-separated folders `search_files` doesn't go into, such as `/Backups/Immich`: a search inside one is refused (Claude browses it with `list_folder`), and a search above one goes around it. Set it as a secret to keep folder names out of `wrangler.toml`; entries are matched against folder paths as `list_folder` shows them, ignoring case and accents; malformed entries are ignored with a warning in `wrangler tail`. See [Serving the whole drive](#serving-the-whole-drive) |
+| `GUIDE_PATH` | Var | `/AGENTS.md` | A file whose first 8 KiB go into the instructions Claude gets when it connects, so you can say what each folder is for. A missing or unreadable file is left out quietly; the empty string turns the guide off |
 
 Routes: `/mcp` is the MCP endpoint, `GET /healthz` answers `200 ok` with no auth and no backend call, and everything else is `404`.
 

@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use pcloud_mcp_core::ServerConfig;
+use pcloud_mcp_core::{ByteRange, Entry, ServerConfig, StorageError};
 use serde_json::{Value, json};
 
 fn initialize(version: &str) -> Value {
@@ -250,4 +250,182 @@ fn tools_call_without_arguments_uses_defaults() {
         json!({"name": "list_folder"}),
     );
     assert_eq!(response["result"]["isError"], json!(false));
+}
+
+// --- instructions: turned-off folders and the owner's guide --------------------------------
+
+fn instructions_of(server: &pcloud_mcp_core::McpServer<MemoryStorage>) -> String {
+    let response = rpc(
+        server,
+        "initialize",
+        json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}),
+    );
+    response["result"]["instructions"]
+        .as_str()
+        .expect("instructions")
+        .to_owned()
+}
+
+fn base_instructions() -> String {
+    instructions_of(&server(sample_storage()))
+}
+
+#[test]
+fn instructions_end_with_the_owners_guide() {
+    let storage = sample_storage().file(
+        "/AGENTS.md",
+        "\u{feff}# My drive\n\n- Notes: to-do lists\n- Photos: phone pictures\n\n",
+    );
+    let server = server(storage);
+    let text = instructions_of(&server);
+    assert_eq!(
+        text,
+        format!(
+            "{}\n\nThe owner's guide to these files (/AGENTS.md):\n\n# My drive\n\n\
+             - Notes: to-do lists\n- Photos: phone pictures",
+            base_instructions()
+        )
+    );
+    assert_eq!(server.storage().take_calls(), ["read /AGENTS.md"]);
+    // 2026-07-28 clients get the same from server/discover.
+    let discover = rpc(&server, "server/discover", json!({}));
+    assert_eq!(discover["result"]["instructions"], json!(text));
+}
+
+#[test]
+fn the_guide_path_is_configurable() {
+    let config = ServerConfig {
+        guide_path: Some("/Notes/Ideas.md".into()),
+        ..ServerConfig::default()
+    };
+    let text = instructions_of(&server_with(sample_storage(), config));
+    assert!(
+        text.ends_with("The owner's guide to these files (/Notes/Ideas.md):\n\nIdeas"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_missing_or_unusable_guide_is_left_out() {
+    let base = base_instructions();
+    assert!(!base.contains("guide to these files ("), "{base}");
+    assert!(base.contains("If the owner wrote a guide"), "{base}");
+    for (what, storage) in [
+        (
+            "binary",
+            sample_storage().file("/AGENTS.md", b"# hi\0there".to_vec()),
+        ),
+        (
+            "not UTF-8",
+            sample_storage().file("/AGENTS.md", b"caf\xe9 au lait".to_vec()),
+        ),
+        ("blank", sample_storage().file("/AGENTS.md", " \n\t\n")),
+        ("a folder", sample_storage().dir("/AGENTS.md")),
+    ] {
+        assert_eq!(instructions_of(&server(storage)), base, "{what}");
+    }
+    // The backend being down doesn't fail the handshake.
+    let config = ServerConfig {
+        guide_path: Some("/broken/AGENTS.md".into()),
+        ..ServerConfig::default()
+    };
+    assert_eq!(
+        instructions_of(&server_with(sample_storage(), config)),
+        base
+    );
+    // Turned off, it isn't even read.
+    let config = ServerConfig {
+        guide_path: None,
+        ..ServerConfig::default()
+    };
+    let server = server_with(sample_storage().file("/AGENTS.md", "guide"), config);
+    assert_eq!(instructions_of(&server), base);
+    assert!(server.storage().take_calls().is_empty());
+}
+
+#[test]
+fn a_long_guide_is_cut_at_8_kib_on_a_character_boundary() {
+    // After the "a", each é is two bytes, so byte 8192 is the middle of one.
+    let long = format!("a{}", "\u{e9}".repeat(5000));
+    let text = instructions_of(&server(sample_storage().file("/AGENTS.md", long)));
+    let guide = text.split("(/AGENTS.md):\n\n").nth(1).unwrap();
+    let (shown, note) = guide.split_once("\n\n").unwrap();
+    assert_eq!(shown.len(), 8191);
+    assert_eq!(
+        note,
+        "[The guide is longer than this; read the rest with read_text_file at /AGENTS.md with \
+         offset=8191.]"
+    );
+    // Exactly 8 KiB fits, with no note; one byte more doesn't.
+    let text = instructions_of(&server(
+        sample_storage().file("/AGENTS.md", "x".repeat(8192)),
+    ));
+    assert!(text.ends_with(&format!("\n\n{}", "x".repeat(8192))));
+    let text = instructions_of(&server(
+        sample_storage().file("/AGENTS.md", "x".repeat(8193)),
+    ));
+    assert!(
+        text.ends_with("offset=8192.]"),
+        "{}",
+        &text[text.len() - 100..]
+    );
+}
+
+/// A backend that never answers a read.
+struct HangingStorage;
+
+impl pcloud_mcp_core::Storage for HangingStorage {
+    async fn list(&self, path: &str) -> Result<Vec<Entry>, StorageError> {
+        Err(StorageError::NotFound(path.into()))
+    }
+    async fn stat(&self, path: &str) -> Result<Entry, StorageError> {
+        Err(StorageError::NotFound(path.into()))
+    }
+    async fn read(&self, _: &str, _: ByteRange) -> Result<Vec<u8>, StorageError> {
+        std::future::pending().await
+    }
+    async fn search(&self, _: &str, _: &str, _: usize) -> Result<Vec<Entry>, StorageError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn a_guide_read_that_hangs_is_given_up_at_the_deadline() {
+    let server = pcloud_mcp_core::McpServer::new(HangingStorage, ServerConfig::default())
+        .with_guide_deadline(|| std::future::ready(()));
+    let params = json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}});
+    let response = pollster::block_on(server.handle_jsonrpc(request(1, "initialize", params)))
+        .expect("initialize gets a response");
+    assert_eq!(
+        response["result"]["instructions"].as_str(),
+        Some(base_instructions().as_str())
+    );
+    let response =
+        pollster::block_on(server.handle_jsonrpc(request(2, "server/discover", json!({}))))
+            .expect("server/discover gets a response");
+    assert_eq!(
+        response["result"]["instructions"].as_str(),
+        Some(base_instructions().as_str())
+    );
+}
+
+#[test]
+fn a_deadline_does_not_cut_off_a_guide_that_is_ready() {
+    let server = server(sample_storage().file("/AGENTS.md", "guide"))
+        .with_guide_deadline(|| std::future::ready(()));
+    assert!(instructions_of(&server).ends_with("\n\nguide"));
+}
+
+#[test]
+fn instructions_name_the_turned_off_folders() {
+    assert!(!base_instructions().contains("Search is turned off under"));
+    let config = ServerConfig {
+        search_skip: vec!["/Backups/Immich".into(), "/Media".into()],
+        ..ServerConfig::default()
+    };
+    let text = instructions_of(&server_with(sample_storage(), config));
+    assert!(
+        text.ends_with(" Search is turned off under /Backups/Immich, /Media."),
+        "{text}"
+    );
 }

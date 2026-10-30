@@ -6,6 +6,10 @@
 //! version and their capabilities in each request's `_meta`; those requests also get the
 //! stricter header checks and result fields that revision asks for.
 
+use std::future::Future;
+use std::pin::{Pin, pin};
+use std::task::Poll;
+
 use base64::Engine;
 use rmcp::model::{
     CacheScope, DiscoverResult, ErrorCode, ErrorData, Implementation, InitializeResult,
@@ -14,7 +18,7 @@ use rmcp::model::{
 use serde_json::{Map, Value, json};
 
 use crate::http::{HttpRequest, HttpResponse};
-use crate::storage::Storage;
+use crate::storage::{ByteRange, Storage};
 use crate::tools;
 
 /// Limits and identity. Build with struct-update syntax over [`ServerConfig::default`].
@@ -30,6 +34,16 @@ pub struct ServerConfig {
     pub max_image_bytes: u64,
     /// Most results `search_files` returns.
     pub search_limit: usize,
+    /// Folders `search_files` doesn't go into, as normalized absolute paths (see
+    /// [`crate::normalize_path`]). A search at or under one is refused; a search above one
+    /// goes around it. Matched against paths as `list_folder` shows them, ignoring case and
+    /// accents like name search. For folders too big for the backend to search in one call,
+    /// which `list_folder` can still browse.
+    pub search_skip: Vec<String>,
+    /// A text file, normalized like `search_skip`, whose first 8 KiB go into the instructions
+    /// so the owner can tell Claude what each folder is for. `None` turns it off; a missing
+    /// or unreadable file is left out quietly.
+    pub guide_path: Option<String>,
     /// Origins allowed in an `Origin` header; any other gets 403. Requests without the header
     /// (server-to-server) are always allowed. The default is [`CLAUDE_ORIGINS`], in case
     /// Claude's requests carry one.
@@ -39,6 +53,13 @@ pub struct ServerConfig {
 /// Claude's web origins, allowed by default.
 pub const CLAUDE_ORIGINS: &[&str] = &["https://claude.ai", "https://claude.com"];
 
+/// Where the owner's guide is by default: next to the files it describes, editable from any
+/// pCloud client.
+pub const DEFAULT_GUIDE_PATH: &str = "/AGENTS.md";
+
+/// Most of the guide that goes into the instructions; Claude reads them on every connection.
+const MAX_GUIDE_BYTES: usize = 8 * 1024;
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -47,6 +68,8 @@ impl Default for ServerConfig {
             max_read_bytes: 100_000,
             max_image_bytes: 1536 * 1024,
             search_limit: 50,
+            search_skip: Vec::new(),
+            guide_path: Some(DEFAULT_GUIDE_PATH.into()),
             allowed_origins: CLAUDE_ORIGINS.iter().map(|&o| o.to_owned()).collect(),
         }
     }
@@ -83,11 +106,15 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 /// change with a new deployment.
 const LIST_TTL_MS: u64 = 60 * 60 * 1000;
 
-const INSTRUCTIONS: &str = "Read-only access to one folder of the owner's pCloud storage. \
-Paths are relative to that folder's root \"/\" (for example \"/Notes/todo.md\"). \
+const INSTRUCTIONS: &str = "Read-only access to the owner's pCloud storage: the whole drive, or \
+one folder of it. Paths start at its root \"/\" (for example \"/Notes/todo.md\"). \
 Find a path with search_files or list_folder before reading it. \
+search_files skips folders the owner turned off for search and says so; browse those with \
+list_folder. \
 read_text_file returns long files in pages: its first line says which offset to continue from. \
-read_image shows PNG, JPEG, GIF and WebP pictures.";
+read_image shows PNG, JPEG, GIF and WebP pictures. \
+If the owner wrote a guide to their files, it ends these instructions and says what each folder \
+is for.";
 
 /// Which protocol rules a request follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +163,28 @@ impl RpcError {
     }
 }
 
+/// `work`'s output, or `None` when `deadline` finishes first. Polls `work` first, so a result
+/// that is ready wins over a deadline that is too.
+async fn before<T>(work: impl Future<Output = T>, deadline: impl Future<Output = ()>) -> Option<T> {
+    let mut work = pin!(work);
+    let mut deadline = pin!(deadline);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(out) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        deadline.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+/// The part of the owner's guide that goes into the instructions.
+struct Guide<'a> {
+    path: &'a str,
+    text: String,
+    /// Where the rest starts, when the file is longer than what is shown.
+    continue_at: Option<usize>,
+}
+
 /// What a message produced: an HTTP status and a JSON-RPC body.
 struct Reply {
     status: u16,
@@ -159,14 +208,40 @@ impl Reply {
     }
 }
 
+/// Makes a future that finishes when the guide read has taken too long.
+type DeadlineFactory = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()>>>>;
+
 pub struct McpServer<S: Storage> {
     storage: S,
     config: ServerConfig,
+    guide_deadline: Option<DeadlineFactory>,
 }
 
 impl<S: Storage> McpServer<S> {
     pub fn new(storage: S, config: ServerConfig) -> Self {
-        Self { storage, config }
+        Self {
+            storage,
+            config,
+            guide_deadline: None,
+        }
+    }
+
+    /// Bounds the read of the owner's guide during `initialize` and `server/discover`: the
+    /// read is given up, and the guide left out, once the future `deadline` makes finishes.
+    /// The core has no timer of its own, so the runtime supplies one (on Workers,
+    /// `|| worker::Delay::from(Duration::from_millis(1500))`). Without it, a backend that
+    /// never answers holds up the handshake.
+    pub fn with_guide_deadline<F, D>(mut self, deadline: F) -> Self
+    where
+        F: Fn() -> D + 'static,
+        D: Future<Output = ()> + 'static,
+    {
+        self.guide_deadline = Some(Box::new(move || Box::pin(deadline())));
+        self
+    }
+
+    pub fn storage(&self) -> &S {
+        &self.storage
     }
 
     /// Handles one HTTP request to the MCP endpoint. Authentication is the caller's job.
@@ -278,9 +353,9 @@ impl<S: Storage> McpServer<S> {
         };
 
         let result = match method {
-            "initialize" => self.initialize(params),
+            "initialize" => self.initialize(params).await,
             "ping" => Ok(json!({})),
-            "server/discover" => Ok(to_json(&self.discover())),
+            "server/discover" => Ok(to_json(&self.discover().await)),
             "tools/list" => Ok(self.list_tools(era)),
             "tools/call" => self.call_tool(params).await,
             _ => {
@@ -308,7 +383,7 @@ impl<S: Storage> McpServer<S> {
         }
     }
 
-    fn initialize(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+    async fn initialize(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
         let requested = params
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -323,17 +398,82 @@ impl<S: Storage> McpServer<S> {
         let result = InitializeResult::new(self.capabilities())
             .with_protocol_version(version)
             .with_server_info(self.implementation())
-            .with_instructions(INSTRUCTIONS);
+            .with_instructions(self.instructions().await);
         Ok(to_json(&result))
     }
 
-    fn discover(&self) -> DiscoverResult {
+    async fn discover(&self) -> DiscoverResult {
         let mut result = DiscoverResult::new(SUPPORTED_VERSIONS.to_vec(), self.capabilities())
             .with_ttl_ms(LIST_TTL_MS)
             .with_cache_scope(CacheScope::Private)
             .with_server_info(self.implementation());
-        result.instructions = Some(INSTRUCTIONS.into());
+        result.instructions = Some(self.instructions().await);
         result
+    }
+
+    /// The fixed instructions, the folders search skips, and the owner's guide if there is one.
+    async fn instructions(&self) -> String {
+        let mut text = String::from(INSTRUCTIONS);
+        if !self.config.search_skip.is_empty() {
+            text.push_str(" Search is turned off under ");
+            text.push_str(&self.config.search_skip.join(", "));
+            text.push('.');
+        }
+        if let Some(guide) = self.guide().await {
+            text.push_str(&format!(
+                "\n\nThe owner's guide to these files ({}):\n\n{}",
+                guide.path, guide.text
+            ));
+            if let Some(next) = guide.continue_at {
+                text.push_str(&format!(
+                    "\n\n[The guide is longer than this; read the rest with read_text_file at {} \
+                     with offset={next}.]",
+                    guide.path
+                ));
+            }
+        }
+        text
+    }
+
+    /// The start of the owner's guide, or `None` when there is none to show. Any failure, or
+    /// the guide deadline passing, means none: the handshake has to work while the backend is
+    /// down.
+    async fn guide(&self) -> Option<Guide<'_>> {
+        let path = self.config.guide_path.as_deref()?;
+        // One byte more than shown, to tell a cut guide from one that fits exactly.
+        let range = ByteRange {
+            offset: 0,
+            length: MAX_GUIDE_BYTES as u64 + 1,
+        };
+        let read = self.storage.read(path, range);
+        let bytes = match &self.guide_deadline {
+            Some(deadline) => before(read, deadline()).await?,
+            None => read.await,
+        }
+        .ok()?;
+        let cut = bytes.len() > MAX_GUIDE_BYTES;
+        let bytes = &bytes[..bytes.len().min(MAX_GUIDE_BYTES)];
+        if bytes.contains(&0) {
+            return None;
+        }
+        let text = match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            // Only a character cut off by the limit is forgiven; anything else isn't UTF-8.
+            Err(e) if cut && e.error_len().is_none() => {
+                std::str::from_utf8(&bytes[..e.valid_up_to()]).ok()?
+            }
+            Err(_) => return None,
+        };
+        let shown = text.len();
+        let text = text.trim_start_matches('\u{feff}').trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(Guide {
+            path,
+            text: text.to_owned(),
+            continue_at: cut.then_some(shown),
+        })
     }
 
     fn list_tools(&self, era: Era) -> Value {

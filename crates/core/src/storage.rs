@@ -63,9 +63,10 @@ pub trait Storage {
     async fn stat(&self, path: &str) -> Result<Entry, StorageError>;
     /// Bytes of a file in `range`; fewer bytes than asked means the end of the file was reached.
     async fn read(&self, path: &str, range: ByteRange) -> Result<Vec<u8>, StorageError>;
-    /// Files and folders under `root` (any depth) whose name contains `query`, ignoring case
-    /// (the WebDAV backend also ignores accents and Unicode normalization form); at most
-    /// `limit` results.
+    /// Files and folders under `root` (any depth, not `root` itself) whose name matches `query`
+    /// by [`crate::name_matches`] (contains it, ignoring case, accents and Unicode
+    /// normalization form); at most `limit` results. `search_files` also matches names it
+    /// lists itself, so a backend must use the same rule.
     async fn search(
         &self,
         root: &str,

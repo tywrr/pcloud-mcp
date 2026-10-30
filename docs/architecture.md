@@ -13,7 +13,7 @@ How pcloud-mcp is put together, and why. For running it, see [setup.md](setup.md
 | `OAUTH_KV` | Workers KV | | OAuth clients, grants and token hashes |
 | Cloudflare Tunnel + Workers VPC service | Cloudflare | | A private path from the core to `127.0.0.1:8080` on the laptop; no public hostname |
 | `cloudflared` | Laptop, `systemd --user` | `deploy/systemd/pcloud-mcp-tunnel.service` | The tunnel's connector; dials out over QUIC |
-| `rclone serve webdav` | Laptop, `systemd --user` | `deploy/systemd/pcloud-mcp-webdav.service` | Serves one folder of the mount read-only on `127.0.0.1:8080`, with Basic auth |
+| `rclone serve webdav` | Laptop, `systemd --user` | `deploy/systemd/pcloud-mcp-webdav.service`, `deploy/rclone-filter.txt` | Serves one folder of the mount, or all of it minus what the filter file hides, read-only on `127.0.0.1:8080`, with Basic auth |
 | pCloud Drive | Laptop | pCloud's app | FUSE mount at `~/pCloudDrive`; fetches contents from pCloud on demand and caches them |
 
 The Worker names are fixed in the code and config: the auth front's service binding points at `pcloud-mcp-core` by name.
@@ -112,9 +112,13 @@ The tools see only this (in `crates/core/src/storage.rs`). Paths are normalized 
 | `read` | `GET` with `Range` | `getfilelink`, then a ranged `GET` by the Worker itself (links are tied to the requesting IP, so they can't be handed to Claude) |
 | `search` | one `PROPFIND` with `Depth: infinity`, names matched in the Worker; if the server refuses infinite depth, a breadth-first walk of `Depth: 1` listings capped at 40 requests | `search` (undocumented) or a `listfolder` walk |
 
+Names are matched by `pcloud_mcp_core::name_matches` (case- and accent-insensitive), in the backend and in the core alike: `search_files` matches names itself when it splits a search around a `SEARCH_SKIP` folder. It refuses a search at or inside one; above one, it lists each folder on the way down (`list`), matches those names, and calls `search` on every other subfolder, at most 40 calls in all. A subfolder that fails is noted in the result rather than failing the call.
+
 Workers has no `PROPFIND` in `worker::Method`, so the Worker builds those requests through `web_sys`. When `BACKEND_URL` is set, requests go there with plain `fetch`; it lives only in `.dev.vars`, which is how local development reaches `scripts/dev-backend.sh` on `127.0.0.1:8081` even with the `[[vpc_services]]` block in place. Deployed, there's no `BACKEND_URL`, and requests go through the VPC binding (`PCLOUD_BACKEND`). With neither, `/mcp` answers `500 server misconfigured: no backend`.
 
-A `PROPFIND` answer bigger than `MAX_LISTING_BYTES` (400,000 bytes by default) isn't parsed: the tool returns an error telling Claude to narrow the path. That keeps a huge folder from running the Worker out of CPU halfway through.
+A `PROPFIND` answer bigger than `MAX_LISTING_BYTES` (400,000 bytes by default) isn't parsed: the tool returns an error telling Claude to narrow the path. That keeps a huge folder from running the Worker out of CPU halfway through. It isn't even read past the limit: the request tells the transport how much it will use (`TransportRequest::max_response_bytes`), and the Worker reads the body stream chunk by chunk and cancels it there, which closes the connection back to rclone. So a `Depth: infinity` answer of 50 MB costs the Worker about 400 kB of memory, and the connection is closed instead of drained. The limit is per request, not per listing: the storage is built per request, and all its listings draw on one budget, so a split search can't parse a full listing for each subfolder. Answers too big to parse are still charged for the bytes that came in before the cut: once a request has received twice `MAX_LISTING_BYTES` in all, further listings fail as too many entries without being asked for, so a split search over many oversized subfolders can't read the limit's worth for each one.
+
+`initialize` (and `server/discover`) also reads the first 8 KiB of the owner's guide, `/AGENTS.md` by default (`GUIDE_PATH`), with one ranged `GET`, and appends it to the instructions. Any error leaves it out.
 
 ## Limits
 
@@ -122,7 +126,7 @@ A `PROPFIND` answer bigger than `MAX_LISTING_BYTES` (400,000 bytes by default) i
 |---|---|---|
 | Text per `read_text_file` call | 100,000 bytes (`MAX_READ_BYTES`) | This project, under Claude's ~150,000-character cap on a tool result |
 | Image size for `read_image` | 1.5 MiB (`MAX_IMAGE_BYTES`) | This project, for the free plan's CPU; base64 makes it a third larger in the result |
-| Listing answer the core parses | 400,000 bytes (`MAX_LISTING_BYTES`) | This project, for the free plan's CPU; one `PROPFIND` for `list_folder`, or the `Depth: infinity` one for `search_files` |
+| Listing answer the core parses | 400,000 bytes per request (`MAX_LISTING_BYTES`) | This project, for the free plan's CPU; one `PROPFIND` for `list_folder`, or the `Depth: infinity` one for `search_files` (all of them together, when a search goes around `SEARCH_SKIP` folders) |
 | Results per `search_files` | 50 (`SEARCH_LIMIT`) | This project |
 | Time per tool call | 240 s | Claude |
 | `/token` response | 10 s (30 s for refreshes) | Claude |
@@ -133,4 +137,4 @@ A `PROPFIND` answer bigger than `MAX_LISTING_BYTES` (400,000 bytes by default) i
 | KV writes | 1,000 a day | Workers free plan; once they're used up, sign-ins and token refreshes fail until 00:00 UTC. A sign-in writes a few keys (grant, code, tokens) and each refresh a couple more. Nothing is written before the right passphrase except client registrations, and `/register` takes those only from `DCR_ALLOWED_CIDRS` |
 | Metadata cache | about 5 minutes | Claude caches the server's metadata and tool list |
 
-The CPU limit is the one to watch: parsing a `PROPFIND` answer and base64-encoding an image cost real CPU, and 10 ms isn't much. On the free plan, `search_files` stays under it up to roughly 1,000 entries in the tree it searches, `list_folder` up to roughly 1,000 to 1,500 entries in one folder, and `read_image` up to about 1.5 MiB. `MAX_IMAGE_BYTES` defaults to 1.5 MiB, and `MAX_LISTING_BYTES` (400,000 bytes, about a thousand entries of rclone's XML) turns a bigger listing into an error that tells Claude to narrow the path, rather than a CPU-limit failure. So serve a focused folder rather than the whole drive. [Workers Paid](https://developers.cloudflare.com/workers/platform/pricing/) ($5 a month, 30 s of CPU per request by default) lifts this; raise both vars there.
+The CPU limit is the one to watch: parsing a `PROPFIND` answer and base64-encoding an image cost real CPU, and 10 ms isn't much. On the free plan, `search_files` stays under it up to roughly 1,000 entries in the tree it searches, `list_folder` up to roughly 1,000 to 1,500 entries in one folder, and `read_image` up to about 1.5 MiB. `MAX_IMAGE_BYTES` defaults to 1.5 MiB, and `MAX_LISTING_BYTES` (400,000 bytes, about a thousand entries of rclone's XML) turns a bigger listing into an error that tells Claude to narrow the path, rather than a CPU-limit failure. So serve a focused folder, or the whole drive with its huge folders in `SEARCH_SKIP`. [Workers Paid](https://developers.cloudflare.com/workers/platform/pricing/) ($5 a month, 30 s of CPU per request by default) lifts this; raise both vars there.

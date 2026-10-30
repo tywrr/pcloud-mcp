@@ -12,6 +12,7 @@ use base64::Engine;
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotations, object};
 use serde_json::{Map, Value, json};
 
+use crate::matching::{NameMatcher, fold};
 use crate::server::ServerConfig;
 use crate::storage::{ByteRange, Entry, Storage, StorageError, normalize_path};
 
@@ -28,6 +29,9 @@ const MAX_LIST_ENTRIES: usize = 1000;
 const MAX_LISTING_CHARS: usize = 120_000;
 /// How much of a file is checked for NUL bytes before it is treated as binary (git does the same).
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// Most storage calls a search split around turned-off folders makes. Each is a request to
+/// the WebDAV backend, and the Workers free plan allows 50 subrequests per request.
+const MAX_SPLIT_CALLS: usize = 40;
 
 const PNG: &str = "image/png";
 const JPEG: &str = "image/jpeg";
@@ -139,7 +143,8 @@ pub(crate) fn definitions(config: &ServerConfig) -> Vec<Tool> {
             &format!(
                 "Find files and folders whose name contains the query, ignoring case and accents, \
                  anywhere under a folder. Matches names only, not file contents. Returns up to \
-                 {search_limit} results with their full paths."
+                 {search_limit} results with their full paths. Skips folders the owner turned \
+                 off for search, and says which."
             ),
             json!({
                 "type": "object",
@@ -432,27 +437,221 @@ async fn search_files<S: Storage>(
         None => max,
     };
 
-    let mut found = storage
-        .search(&root, query, limit)
-        .await
-        .map_err(storage_error)?;
-    found.truncate(limit);
-    if found.is_empty() {
-        return Ok(vec![ContentBlock::text(format!(
-            "No files or folders under {root} have names containing \"{query}\"."
-        ))]);
+    // Compared folded, like names in search: an entry matches the folder whatever its case
+    // or accents, so "/backups/immich" turns off "/Backups/Immich" as list_folder shows it.
+    let skip: Vec<String> = config.search_skip.iter().map(|f| fold(f)).collect();
+    let folded_root = fold(&root);
+    if let Some(i) = skip
+        .iter()
+        .position(|folder| is_at_or_under(&folded_root, folder))
+    {
+        let off = &config.search_skip[i];
+        return Err(format!(
+            "Search is turned off under {off} because it's too large. Browse it with list_folder \
+             instead."
+        ));
     }
-    let mut text = format!(
-        "{} for \"{query}\" under {root}:\n",
-        count(found.len(), "match", "matches")
-    );
+    let (found, notes) = if skip.iter().any(|folder| is_under(folder, &folded_root)) {
+        let mut split = SplitSearch::new(storage, query, &skip, limit);
+        split.folder(&root).await.map_err(storage_error)?;
+        split.finish(&root)?
+    } else {
+        let mut found = storage
+            .search(&root, query, limit)
+            .await
+            .map_err(storage_error)?;
+        found.truncate(limit);
+        (found, Vec::new())
+    };
+
+    let mut text = if found.is_empty() {
+        let partly = if notes.is_empty() {
+            ""
+        } else {
+            " in the folders that were searched"
+        };
+        format!("No files or folders under {root} have names containing \"{query}\"{partly}.")
+    } else {
+        format!(
+            "{} for \"{query}\" under {root}:\n",
+            count(found.len(), "match", "matches")
+        )
+    };
     let shown = push_entry_lines(&mut text, found.iter());
     if found.len() == limit || shown < found.len() {
         text.push_str(&format!(
             "Showing the first {shown} matches; there may be more. Narrow the query or the path.\n"
         ));
     }
+    for note in &notes {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(note);
+    }
     Ok(vec![ContentBlock::text(text)])
+}
+
+/// A search that goes around turned-off folders: it lists every folder with one somewhere
+/// inside (matching the names itself), and searches each other subfolder whole. A subfolder
+/// that fails doesn't sink the rest; the result says which ones were left out.
+struct SplitSearch<'a, S> {
+    storage: &'a S,
+    query: &'a str,
+    matcher: NameMatcher,
+    /// The turned-off folders, folded (see [`fold`]).
+    skip: &'a [String],
+    limit: usize,
+    calls: usize,
+    found: Vec<Entry>,
+    /// Subfolder searches that worked.
+    searched: usize,
+    /// Turned-off folders passed on the way.
+    skipped: Vec<String>,
+    /// Subfolders with too many entries to search in this call.
+    too_large: Vec<String>,
+    /// Other subfolders that failed, each with the reason.
+    failed: Vec<String>,
+    /// Why the search ended before going through everything.
+    stopped: Option<String>,
+}
+
+impl<'a, S: Storage> SplitSearch<'a, S> {
+    fn new(storage: &'a S, query: &'a str, skip: &'a [String], limit: usize) -> Self {
+        Self {
+            storage,
+            query,
+            matcher: NameMatcher::new(query),
+            skip,
+            limit,
+            calls: 0,
+            found: Vec::new(),
+            searched: 0,
+            skipped: Vec::new(),
+            too_large: Vec::new(),
+            failed: Vec::new(),
+            stopped: None,
+        }
+    }
+
+    /// Goes through the children of `dir`, which has a turned-off folder inside. Fails only
+    /// when `dir` itself can't be listed.
+    async fn folder(&mut self, dir: &str) -> Result<(), StorageError> {
+        self.calls += 1;
+        let mut children = self.storage.list(dir).await?;
+        children.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase(), e.name.clone()));
+        for child in children {
+            if self.found.len() >= self.limit || self.stopped.is_some() {
+                break;
+            }
+            let (path, is_dir) = (child.path.clone(), child.is_dir);
+            if self.matcher.matches(&child.name) {
+                self.found.push(child);
+                if self.found.len() >= self.limit {
+                    break;
+                }
+            }
+            if !is_dir {
+                continue;
+            }
+            let folded = fold(&path);
+            if self.skip.contains(&folded) {
+                self.skipped.push(path);
+                continue;
+            }
+            if self.calls >= MAX_SPLIT_CALLS {
+                self.stopped = Some(format!("it reached its limit of {MAX_SPLIT_CALLS} folders"));
+                break;
+            }
+            let result = if self.skip.iter().any(|folder| is_under(folder, &folded)) {
+                Box::pin(self.folder(&path)).await
+            } else {
+                self.search(&path).await
+            };
+            if let Err(err) = result {
+                self.left_out(path, err);
+            }
+        }
+        Ok(())
+    }
+
+    async fn search(&mut self, dir: &str) -> Result<(), StorageError> {
+        self.calls += 1;
+        let room = self.limit - self.found.len();
+        let hits = self.storage.search(dir, self.query, room).await?;
+        self.searched += 1;
+        self.found.extend(hits.into_iter().take(room));
+        Ok(())
+    }
+
+    fn left_out(&mut self, path: String, err: StorageError) {
+        match err {
+            StorageError::TooManyEntries(_) => self.too_large.push(path),
+            err => {
+                if matches!(err, StorageError::Backend(_)) {
+                    // Most likely down for every other folder too.
+                    self.stopped = Some("the file server stopped answering".into());
+                }
+                self.failed
+                    .push(format!("{path} ({})", redact_urls(&err.to_string())));
+            }
+        }
+    }
+
+    /// The matches and notes on what was left out, or an error when no subfolder could be
+    /// searched and nothing matched.
+    fn finish(self, root: &str) -> Result<(Vec<Entry>, Vec<String>), String> {
+        let mut notes = Vec::new();
+        if !self.too_large.is_empty() {
+            notes.push(format!(
+                "Not searched, too many entries to go through in one call: {}. Search inside {} \
+                 directly, with a narrower path.",
+                self.too_large.join(", "),
+                if self.too_large.len() == 1 {
+                    "it"
+                } else {
+                    "each"
+                }
+            ));
+        }
+        for failure in &self.failed {
+            notes.push(format!("Could not search {failure}."));
+        }
+        if !self.skipped.is_empty() {
+            notes.push(format!(
+                "Skipped {}: search is turned off there. Browse with list_folder instead.",
+                self.skipped.join(", ")
+            ));
+        }
+        if let Some(why) = &self.stopped {
+            notes.push(format!(
+                "The search stopped early because {why}; there may be more matches."
+            ));
+        }
+        let failed_everywhere =
+            self.searched == 0 && !(self.too_large.is_empty() && self.failed.is_empty());
+        if failed_everywhere && self.found.is_empty() {
+            return Err(format!(
+                "Nothing under {root} could be searched.\n{}",
+                notes.join("\n")
+            ));
+        }
+        let notes = notes.into_iter().map(|note| note + "\n").collect();
+        Ok((self.found, notes))
+    }
+}
+
+/// True when `path` is `folder` or anywhere inside it (both normalized).
+fn is_at_or_under(path: &str, folder: &str) -> bool {
+    folder == "/"
+        || path
+            .strip_prefix(folder)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// True when `path` is inside `folder`, at any depth, but not `folder` itself.
+fn is_under(path: &str, folder: &str) -> bool {
+    path != folder && is_at_or_under(path, folder)
 }
 
 /// Appends one line per entry while the listing stays under [`MAX_LISTING_CHARS`]; returns
@@ -688,6 +887,21 @@ mod tests {
         assert_eq!(human_size(1536), "1.5 KiB");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 MiB");
         assert_eq!(human_size(u64::MAX), "16383.9 PiB");
+    }
+
+    #[test]
+    fn paths_under_folders() {
+        assert!(is_at_or_under("/a", "/a"));
+        assert!(is_at_or_under("/a/b", "/a"));
+        assert!(is_at_or_under("/a", "/"));
+        assert!(is_at_or_under("/", "/"));
+        assert!(!is_at_or_under("/ab", "/a"));
+        assert!(!is_at_or_under("/", "/a"));
+        assert!(is_under("/a/b", "/a"));
+        assert!(is_under("/a", "/"));
+        assert!(!is_under("/a", "/a"));
+        assert!(!is_under("/", "/"));
+        assert!(!is_under("/ab/c", "/a"));
     }
 
     #[test]

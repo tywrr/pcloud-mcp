@@ -2,7 +2,7 @@
 
 Let **Claude** read the files in your **pCloud**: text and images, from claude.ai, the Claude apps, Claude Code and **Claude Duet**, through a custom connector you host yourself.
 
-pCloud has an [official MCP server](https://mcp.pcloud.com/mcp), and it's good at organizing files, but none of its tools return what's inside one. pcloud-mcp fills that gap: Claude can list, search and read text files and images in one pCloud folder you choose. It's read-only for now.
+pCloud has an [official MCP server](https://mcp.pcloud.com/mcp), and it's good at organizing files, but none of its tools return what's inside one. pcloud-mcp fills that gap: Claude can list, search and read text files and images in one pCloud folder you choose, or the whole drive. It's read-only for now.
 
 It's a remote MCP server on Cloudflare Workers: a Rust Worker with the tools, behind a small TypeScript Worker that handles OAuth. The free plan runs it for a focused folder of up to about a thousand files; see [limitations](#limitations). You add it in claude.ai like any other connector and approve it with a passphrase only you know. Claude Duet uses the connectors on your claude.ai account, so Duet gets it too.
 
@@ -24,10 +24,10 @@ So the laptop has to be on, awake and running pCloud Drive. A backend that calls
 | Read images | No | Yes, up to 1.5 MiB by default |
 | Create, copy, move, rename, upload, public links | Yes | No (read-only for now) |
 | Delete | No | No |
-| What Claude can reach | Your whole account | One folder you choose |
+| What Claude can reach | Your whole account | One folder you choose, or the whole drive minus what you filter out |
 | Works with your laptop off | Yes | Not yet |
 
-They don't conflict. Add both, and Claude organizes with pCloud's and reads with this one.
+They don't conflict. Add both, and Claude organizes with pCloud's and reads with this one. Serve the whole drive and the paths match too, so Claude can find a file with one and read it with the other.
 
 ## Tools
 
@@ -37,9 +37,9 @@ They don't conflict. Add both, and Claude organizes with pCloud's and reads with
 | `get_file_info` | `path` | Name, type, size, modified time and content type of one file or folder |
 | `read_text_file` | `path`, `offset` (default 0), `max_bytes` | Text from `offset`, at most `MAX_READ_BYTES` (100,000) bytes per call; Claude calls again with a later offset to read on |
 | `read_image` | `path` | The image itself (PNG, JPEG, GIF or WebP), if it's at most `MAX_IMAGE_BYTES` (1.5 MiB) |
-| `search_files` | `query`, `path` (default `/`), `limit` | Files and folders under `path` whose **name** contains `query`, case-insensitively, at most `SEARCH_LIMIT` (50) |
+| `search_files` | `query`, `path` (default `/`), `limit` | Files and folders under `path` whose **name** contains `query`, ignoring case and accents, at most `SEARCH_LIMIT` (50). It goes around folders you turn off with `SEARCH_SKIP` |
 
-Paths are relative to the folder you serve: `/` is its root, and `..` is rejected.
+Paths are relative to the folder you serve: `/` is its root, and `..` is rejected. An `AGENTS.md` at that root, if you write one, goes into the instructions Claude gets when it connects: say there what each folder is for ([setup](docs/setup.md#serving-the-whole-drive)).
 
 ## How it works
 
@@ -80,14 +80,14 @@ flowchart LR
 
 What it doesn't protect against:
 
-- **Anything in the served folder can reach Claude.** Don't serve folders with IDs, tax papers or password exports. (The Crypto Folder can't be served anyway: it's unreadable while locked.)
+- **Anything in the served folder can reach Claude.** Don't serve folders with IDs, tax papers or password exports. When you serve the whole drive, hide them with rclone's filter file, and hide the Crypto Folder too: it's unreadable while locked, but pCloud Drive shows it in plain text whenever it's unlocked.
 - **File contents are untrusted input.** A file can contain instructions aimed at Claude (prompt injection). Read-only tools limit what that can do.
 - **Cloudflare and Anthropic see the traffic.** TLS ends at Cloudflare's edge, as with any Worker, and tool results pass through Anthropic, as with any connector.
 
 ## Limitations
 
 - **Your laptop must be on, awake, online and running pCloud Drive.** While it sleeps, tools fail with a backend error.
-- **The Workers free plan allows 10 ms of CPU per request.** Waiting on the laptop doesn't count, but parsing listings and encoding images does. On the free plan, `search_files` stays under it up to roughly 1,000 entries under the path it searches (the whole served folder by default), `list_folder` up to roughly 1,000 to 1,500 entries in one folder, and `read_image` up to about 1.5 MiB, the default `MAX_IMAGE_BYTES`. A listing bigger than `MAX_LISTING_BYTES` (400,000 bytes) fails cleanly, as a tool error that tells Claude to narrow the path, instead of running out of CPU. So serve a focused folder. [Workers Paid](https://developers.cloudflare.com/workers/platform/pricing/) ($5 a month, 30 s of CPU per request) lifts this; raise `MAX_LISTING_BYTES` and `MAX_IMAGE_BYTES` there. The free plan's other limits (128 MB memory, 50 subrequests per request, 100,000 requests and 1,000 KV writes a day) are plenty for one person.
+- **The Workers free plan allows 10 ms of CPU per request.** Waiting on the laptop doesn't count, but parsing listings and encoding images does. On the free plan, `search_files` stays under it up to roughly 1,000 entries under the path it searches (the whole served folder by default), `list_folder` up to roughly 1,000 to 1,500 entries in one folder, and `read_image` up to about 1.5 MiB, the default `MAX_IMAGE_BYTES`. A listing bigger than `MAX_LISTING_BYTES` (400,000 bytes) fails cleanly, as a tool error that tells Claude to narrow the path, instead of running out of CPU. So serve a focused folder, or serve the whole drive and list its huge folders (a photo backup, say) in `SEARCH_SKIP`: searches then go around them, and Claude browses them with `list_folder` ([Serving the whole drive](docs/setup.md#serving-the-whole-drive)). [Workers Paid](https://developers.cloudflare.com/workers/platform/pricing/) ($5 a month, 30 s of CPU per request) lifts this; raise `MAX_LISTING_BYTES` and `MAX_IMAGE_BYTES` there. The free plan's other limits (128 MB memory, 50 subrequests per request, 100,000 requests and 1,000 KV writes a day) are plenty for one person.
 - **Claude's limits:** a tool result is capped at about 150,000 characters (which is why reads are paged) and a call at 240 seconds.
 - **Claude Duet is a research preview** (US Pro and Max, since 2026-10-21). It uses your claude.ai connectors when you talk to it; its scheduled and background runs may skip custom connectors.
 - **claude.ai sometimes doesn't finish adding a custom connector, or hides its tools** even when it shows Connected ([anthropics/claude-ai-mcp#831](https://github.com/anthropics/claude-ai-mcp/issues/831), [#476](https://github.com/anthropics/claude-ai-mcp/issues/476)). The desktop and mobile apps and Claude Code usually work when the web doesn't; see [troubleshooting](docs/setup.md#sign-in-succeeds-but-the-card-stays-on-connect-or-the-tools-never-appear).

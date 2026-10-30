@@ -2,10 +2,12 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pcloud_mcp_core::{
     ByteRange, Entry, HttpRequest, HttpResponse, McpServer, ServerConfig, Storage, StorageError,
+    name_matches,
 };
 use serde_json::{Value, json};
 
@@ -20,6 +22,11 @@ pub const HUGE: &str = "/huge";
 pub struct MemoryStorage {
     /// Normalized path to (is_dir, contents, content type).
     nodes: BTreeMap<String, (bool, Vec<u8>, Option<String>)>,
+    /// Folders too big to search: searching them or any folder above them fails, as one
+    /// WebDAV listing of the whole tree would.
+    too_big: BTreeSet<String>,
+    /// Every call, as "list /path", "search /path", "stat /path" or "read /path".
+    pub calls: RefCell<Vec<String>>,
 }
 
 impl MemoryStorage {
@@ -33,6 +40,24 @@ impl MemoryStorage {
         self.add_parents(path);
         self.nodes.insert(path.into(), (true, Vec::new(), None));
         self
+    }
+
+    /// Marks a folder (created if missing) as too big to search.
+    pub fn too_big(mut self, path: &str) -> Self {
+        if !self.nodes.contains_key(path) {
+            self = self.dir(path);
+        }
+        self.too_big.insert(path.into());
+        self
+    }
+
+    /// The calls so far, and forgets them.
+    pub fn take_calls(&self) -> Vec<String> {
+        self.calls.take()
+    }
+
+    fn log(&self, call: &str, path: &str) {
+        self.calls.borrow_mut().push(format!("{call} {path}"));
     }
 
     pub fn file(self, path: &str, data: impl Into<Vec<u8>>) -> Self {
@@ -108,7 +133,13 @@ impl MemoryStorage {
 
 impl Storage for MemoryStorage {
     async fn list(&self, path: &str) -> Result<Vec<Entry>, StorageError> {
+        self.log("list", path);
         Self::check_listing(path)?;
+        if self.too_big.contains(path) {
+            return Err(StorageError::TooManyEntries(format!(
+                "{path} (a 500000-byte WebDAV listing; the limit is 400000 bytes)"
+            )));
+        }
         let entry = self
             .entry(path)
             .ok_or_else(|| StorageError::NotFound(path.into()))?;
@@ -125,12 +156,14 @@ impl Storage for MemoryStorage {
     }
 
     async fn stat(&self, path: &str) -> Result<Entry, StorageError> {
+        self.log("stat", path);
         Self::check(path)?;
         self.entry(path)
             .ok_or_else(|| StorageError::NotFound(path.into()))
     }
 
     async fn read(&self, path: &str, range: ByteRange) -> Result<Vec<u8>, StorageError> {
+        self.log("read", path);
         Self::check(path)?;
         let (is_dir, data, _) = self
             .nodes
@@ -150,20 +183,29 @@ impl Storage for MemoryStorage {
         query: &str,
         limit: usize,
     ) -> Result<Vec<Entry>, StorageError> {
+        self.log("search", root);
         Self::check_listing(root)?;
+        if self
+            .too_big
+            .iter()
+            .any(|big| big == root || Self::is_under(big, root))
+        {
+            return Err(StorageError::TooManyEntries(format!(
+                "{root} (a 500000-byte WebDAV listing; the limit is 400000 bytes)"
+            )));
+        }
         let root_entry = self
             .entry(root)
             .ok_or_else(|| StorageError::NotFound(root.into()))?;
         if !root_entry.is_dir {
             return Err(StorageError::NotADirectory(root.into()));
         }
-        let query = query.to_lowercase();
         Ok(self
             .nodes
             .keys()
             .filter(|p| *p != root && Self::is_under(p, root))
             .filter_map(|p| self.entry(p))
-            .filter(|e| e.name.to_lowercase().contains(&query))
+            .filter(|e| name_matches(query, &e.name))
             .take(limit)
             .collect())
     }

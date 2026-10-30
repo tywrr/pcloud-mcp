@@ -12,12 +12,14 @@
 mod backend;
 mod settings;
 
+use std::time::Duration;
+
 use pcloud_mcp_core::{HttpRequest, HttpResponse, McpServer};
 use pcloud_mcp_webdav::WebDavStorage;
 use subtle::ConstantTimeEq;
 use worker::{
-    Context, Env, Headers, Request, Response, ResponseBody, Result, console_error, console_warn,
-    event,
+    Context, Delay, Env, Headers, Request, Response, ResponseBody, Result, console_error,
+    console_warn, event,
 };
 
 use crate::backend::Backend;
@@ -25,6 +27,10 @@ use crate::backend::Backend;
 /// JSON-RPC requests are small; this only stops someone (with the token) from making the
 /// Worker buffer something huge.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// How long `initialize` waits for the owner's guide before answering without it, so a file
+/// server that doesn't answer can't hold up the handshake.
+const GUIDE_DEADLINE: Duration = Duration::from_millis(1500);
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -82,7 +88,8 @@ async fn mcp(mut req: Request, method: String, env: &Env) -> Result<Response> {
     let via = backend.describe();
     let storage = WebDavStorage::new(backend, &settings.backend_user, &settings.backend_password)
         .with_max_listing_bytes(settings.max_listing_bytes);
-    let server = McpServer::new(storage, settings.server);
+    let server = McpServer::new(storage, settings.server)
+        .with_guide_deadline(|| Delay::from(GUIDE_DEADLINE));
 
     let request = HttpRequest {
         method: method.clone(),
@@ -117,12 +124,11 @@ fn loggable(value: &str) -> String {
     }
 }
 
-/// Vars and secrets are both plain strings at runtime; blank counts as unset.
+/// A var or secret as it is set (blank included; `settings` decides what blank means). In
+/// workers-rs 0.8.7 `Secret` and `Var` are the same string binding, so `Env::var` reads both:
+/// any setting may be a secret, which keeps SEARCH_SKIP's folder names out of wrangler.toml.
 fn env_text(env: &Env, name: &str) -> Option<String> {
-    env.var(name)
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|v| !v.trim().is_empty())
+    env.var(name).ok().map(|v| v.to_string())
 }
 
 /// Checks `Authorization: Bearer <token>`. The comparison takes the same time wherever the

@@ -37,10 +37,18 @@ BACKEND_USER = "mcp"
 #                                          # for a narrower path. Raise it, or MAX_IMAGE_BYTES,
 #                                          # only on the paid plan: parsing and encoding are the
 #                                          # main CPU costs, and the free plan allows 10 ms
+# SEARCH_SKIP = "/Backups/Immich"          # comma-separated folders search_files stays out of
+#                                          # (list_folder still browses them); unset: none.
+#                                          # Better as a secret, to keep your folder names out
+#                                          # of this file: wrangler secret put SEARCH_SKIP
+# GUIDE_PATH = "/AGENTS.md"                # file whose first 8 KiB go into Claude's
+#                                          # instructions, to say what each folder is for;
+#                                          # "" turns it off
 
 # Secrets, set with `wrangler secret put NAME` (and in .dev.vars for local development):
 #   INTERNAL_TOKEN    required; the same value as the auth front's INTERNAL_TOKEN
 #   BACKEND_PASSWORD  rclone's Basic auth password (RCLONE_PASS on the laptop)
+#   SEARCH_SKIP       optional, as above; a secret or a var, not both
 #
 # BACKEND_URL is for local development only and lives in .dev.vars: when it is set, the Worker
 # fetches rclone at that URL directly (http://127.0.0.1:8081, scripts/dev-backend.sh) and

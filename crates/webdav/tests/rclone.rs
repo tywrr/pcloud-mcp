@@ -1,7 +1,7 @@
 //! Runs WebDavStorage against a real `rclone serve webdav` of a copy of fixtures/webdav-root,
 //! through a blocking native transport. Skipped (not failed) when rclone isn't installed.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -35,6 +35,7 @@ impl UreqTransport {
     }
 
     fn send_blocking(&self, request: TransportRequest) -> Result<TransportResponse, String> {
+        let max = request.max_response_bytes;
         let method =
             ureq::http::Method::from_bytes(request.method.as_bytes()).map_err(|e| e.to_string())?;
         let mut builder = ureq::http::Request::builder()
@@ -56,16 +57,36 @@ impl UreqTransport {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
             .collect();
-        let body = response
-            .into_body()
-            .with_config()
-            .limit(64 * 1024 * 1024)
-            .read_to_vec()
-            .map_err(|e| e.to_string())?;
+        let (body, truncated) = match max {
+            // One byte past the limit tells a body that just fits from a longer one. Dropping
+            // the reader before the end closes the connection, as the Worker's transport does.
+            Some(max) => {
+                let mut body = Vec::new();
+                response
+                    .into_body()
+                    .into_reader()
+                    .take(max as u64 + 1)
+                    .read_to_end(&mut body)
+                    .map_err(|e| e.to_string())?;
+                let truncated = body.len() > max;
+                body.truncate(max);
+                (body, truncated)
+            }
+            None => (
+                response
+                    .into_body()
+                    .with_config()
+                    .limit(64 * 1024 * 1024)
+                    .read_to_vec()
+                    .map_err(|e| e.to_string())?,
+                false,
+            ),
+        };
         Ok(TransportResponse {
             status,
             headers,
             body,
+            truncated,
         })
     }
 }
@@ -354,6 +375,26 @@ fn search_the_tree() {
 }
 
 #[test]
+fn listings_are_cut_off_at_the_byte_limit() {
+    let Some(server) = start_server("bounded") else {
+        return;
+    };
+    // The whole tree's answer is a few kB; the transport stops reading after 1,000 bytes, so
+    // the size is never known.
+    let s = storage(&server, PASSWORD).with_max_listing_bytes(1_000);
+    assert_eq!(
+        block(s.search("/", "leaf", 10)).unwrap_err(),
+        StorageError::TooManyEntries("/ (a WebDAV listing, over the 1000-byte limit)".into())
+    );
+    // Small listings still fit, and use up the budget as they go.
+    assert_eq!(block(s.list("/notes")).unwrap().len(), 1);
+    assert!(matches!(
+        block(s.list("/")).unwrap_err(),
+        StorageError::TooManyEntries(_)
+    ));
+}
+
+#[test]
 fn wrong_password_is_permission_denied_without_the_password() {
     let Some(server) = start_server("auth") else {
         return;
@@ -456,4 +497,77 @@ fn mcp_server_end_to_end() {
     }));
     assert_ne!(read["result"]["isError"], true, "{read}");
     assert!(read.to_string().contains("Croissant"), "{read}");
+}
+
+/// A search split around a turned-off folder, and the owner's guide in the instructions,
+/// through the real WebDAV server.
+#[test]
+fn mcp_search_skip_and_guide() {
+    use pcloud_mcp_core::{McpServer, ServerConfig};
+    use serde_json::{Value, json};
+
+    let Some(server) = start_server("skip") else {
+        return;
+    };
+    std::fs::write(
+        server.root.join("AGENTS.md"),
+        "# Guide\n\n- deep: a test tree\n",
+    )
+    .unwrap();
+    let config = ServerConfig {
+        search_skip: vec!["/deep/a/b".into()],
+        ..ServerConfig::default()
+    };
+    let mcp = McpServer::new(storage(&server, PASSWORD), config);
+    let rpc = |method: &str, params: Value| -> Value {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        block(mcp.handle_jsonrpc(body)).unwrap()["result"].clone()
+    };
+    let search = |args: Value| -> String {
+        let result = rpc(
+            "tools/call",
+            json!({"name": "search_files", "arguments": args}),
+        );
+        result["content"][0]["text"].as_str().unwrap().to_owned()
+    };
+
+    let init = rpc(
+        "initialize",
+        json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+    );
+    let instructions = init["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("Search is turned off under /deep/a/b."),
+        "{instructions}"
+    );
+    assert!(
+        instructions.ends_with("(/AGENTS.md):\n\n# Guide\n\n- deep: a test tree"),
+        "{instructions}"
+    );
+
+    // leaf.txt is under the turned-off folder; the other subfolders are searched whole.
+    let leaf = search(json!({"query": "leaf"}));
+    assert!(
+        leaf.starts_with("No files or folders under / have names containing \"leaf\" in the folders that were searched."),
+        "{leaf}"
+    );
+    assert!(
+        leaf.contains("Skipped /deep/a/b: search is turned off there."),
+        "{leaf}"
+    );
+    let found = search(json!({"query": "o"}));
+    assert!(
+        found.starts_with("2 matches for \"o\" under /:\n"),
+        "{found}"
+    );
+    for path in ["/notes", "/notes/todo.md"] {
+        assert!(found.contains(&format!("path: {path}\n")), "{found}");
+    }
+    let pixel = search(json!({"query": "PIXEL"}));
+    assert!(pixel.contains("path: /images/pixel.png\n"), "{pixel}");
+    let refused = search(json!({"query": "leaf", "path": "/deep/a/b/c"}));
+    assert!(
+        refused.starts_with("Search is turned off under /deep/a/b"),
+        "{refused}"
+    );
 }

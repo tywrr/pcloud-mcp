@@ -4,30 +4,35 @@
 //!
 //! Only read methods are used: `PROPFIND` (Depth 0, 1 and infinity) and `GET` with `Range`.
 
-mod matching;
 mod multistatus;
 mod paths;
 mod time;
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::ControlFlow;
 
 use base64::Engine as _;
-use pcloud_mcp_core::{ByteRange, Entry, Storage, StorageError};
+use pcloud_mcp_core::{ByteRange, Entry, NameMatcher, Storage, StorageError};
 
-use crate::matching::NameMatcher;
 use crate::multistatus::parse_multistatus;
 use crate::paths::{encode_path, is_direct_child};
 
 /// One HTTP request to the WebDAV server. `path_and_query` is already percent-encoded and
 /// relative to the server root; the transport adds its base URL (or binding) in front.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransportRequest {
     pub method: String,
     pub path_and_query: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Most body bytes the caller can use. A transport should stop reading the body once it
+    /// passes this, close the connection so the server stops sending, and set
+    /// [`TransportResponse::truncated`]. One that reads everything is still correct, only
+    /// slower: a `Depth: infinity` answer for a big tree can run to tens of megabytes. `None`
+    /// means the whole body.
+    pub max_response_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,6 +40,9 @@ pub struct TransportResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The body was longer than the request's `max_response_bytes`; `body` holds only its
+    /// start.
+    pub truncated: bool,
 }
 
 impl TransportResponse {
@@ -66,10 +74,10 @@ pub trait Transport {
 /// subrequests per request; this leaves room for the Depth: infinity attempt and the rest.
 pub const DEFAULT_WALK_BUDGET: usize = 40;
 
-/// Largest PROPFIND answer, in bytes, that a listing or search goes through (for a walk, all
-/// its listings together). Parsing is the Worker's main CPU cost: 400 kB is about 1,000
-/// entries from rclone, which take a search about 4 ms and a listing about 7 ms in V8, of the
-/// 10 ms the Workers free plan allows a request.
+/// Most PROPFIND answer bytes one storage parses, its listings and searches together. Parsing
+/// is the Worker's main CPU cost: 400 kB is about 1,000 entries from rclone, which take a
+/// search about 4 ms and a listing about 7 ms in V8, of the 10 ms the Workers free plan allows
+/// a request.
 pub const DEFAULT_MAX_LISTING_BYTES: usize = 400_000;
 
 /// Asks only for what [`Entry`] needs. Against rclone this makes answers about 30% smaller
@@ -87,7 +95,17 @@ pub struct WebDavStorage<T: Transport> {
     authorization: String,
     walk_budget: usize,
     max_listing_bytes: usize,
+    /// PROPFIND answer bytes taken in so far, against `max_listing_bytes`.
+    parsed: Cell<usize>,
+    /// PROPFIND answer bytes received so far, parsed or not (cut-off and oversized answers
+    /// too), against [`RECEIVE_FACTOR`] times `max_listing_bytes`.
+    received: Cell<usize>,
 }
+
+/// How many times `max_listing_bytes` one storage may receive in PROPFIND answers, the ones
+/// too big to parse included. Without it, a split search whose subfolders are all too big
+/// would read up to `max_listing_bytes` for each of them before giving up.
+const RECEIVE_FACTOR: usize = 2;
 
 impl<T: Transport> fmt::Debug for WebDavStorage<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -95,6 +113,8 @@ impl<T: Transport> fmt::Debug for WebDavStorage<T> {
         f.debug_struct("WebDavStorage")
             .field("walk_budget", &self.walk_budget)
             .field("max_listing_bytes", &self.max_listing_bytes)
+            .field("parsed", &self.parsed.get())
+            .field("received", &self.received.get())
             .finish_non_exhaustive()
     }
 }
@@ -109,6 +129,8 @@ impl<T: Transport> WebDavStorage<T> {
             authorization: format!("Basic {credentials}"),
             walk_budget: DEFAULT_WALK_BUDGET,
             max_listing_bytes: DEFAULT_MAX_LISTING_BYTES,
+            parsed: Cell::new(0),
+            received: Cell::new(0),
         }
     }
 
@@ -118,8 +140,13 @@ impl<T: Transport> WebDavStorage<T> {
         self
     }
 
-    /// Caps the PROPFIND answer a listing or search parses (see [`DEFAULT_MAX_LISTING_BYTES`]);
-    /// past it they fail with [`StorageError::TooManyEntries`].
+    /// Caps the PROPFIND answer bytes this storage parses, all its listings and searches
+    /// together (see [`DEFAULT_MAX_LISTING_BYTES`]); past it they fail with
+    /// [`StorageError::TooManyEntries`], and the transport is asked to stop reading there. The
+    /// cap is for CPU time, which Workers limits per request, so build one storage per request,
+    /// as the Worker does: a split search then can't parse a full listing for every subfolder.
+    /// Answers too big to parse still cost the time to receive them, so the storage also stops
+    /// asking once it has received twice this much in all.
     pub fn with_max_listing_bytes(mut self, bytes: usize) -> Self {
         self.max_listing_bytes = bytes;
         self
@@ -135,6 +162,7 @@ impl<T: Transport> WebDavStorage<T> {
         path: &str,
         mut headers: Vec<(String, String)>,
         body: Vec<u8>,
+        max_response_bytes: Option<usize>,
     ) -> Result<TransportResponse, StorageError> {
         headers.push(("Authorization".into(), self.authorization.clone()));
         let request = TransportRequest {
@@ -142,6 +170,7 @@ impl<T: Transport> WebDavStorage<T> {
             path_and_query: encode_path(path),
             headers,
             body,
+            max_response_bytes,
         };
         self.transport.send(request).await.map_err(|e| {
             StorageError::Backend(format!(
@@ -150,7 +179,12 @@ impl<T: Transport> WebDavStorage<T> {
         })
     }
 
-    async fn propfind(&self, path: &str, depth: &str) -> Result<TransportResponse, StorageError> {
+    async fn propfind(
+        &self,
+        path: &str,
+        depth: &str,
+        max_bytes: usize,
+    ) -> Result<TransportResponse, StorageError> {
         let headers = vec![
             ("Depth".into(), depth.into()),
             (
@@ -158,8 +192,18 @@ impl<T: Transport> WebDavStorage<T> {
                 "application/xml; charset=utf-8".into(),
             ),
         ];
-        self.send("PROPFIND", path, headers, PROPFIND_BODY.into())
-            .await
+        let response = self
+            .send(
+                "PROPFIND",
+                path,
+                headers,
+                PROPFIND_BODY.into(),
+                Some(max_bytes),
+            )
+            .await?;
+        self.received
+            .set(self.received.get().saturating_add(response.body.len()));
+        Ok(response)
     }
 
     fn parse<W, F>(&self, body: &[u8], wanted: W, visit: F) -> Result<(), StorageError>
@@ -171,21 +215,66 @@ impl<T: Transport> WebDavStorage<T> {
             .map_err(StorageError::Backend)
     }
 
-    /// The error for a listing of `bytes` when only `self.max_listing_bytes` may be parsed.
-    fn too_many_entries(&self, path: &str, bytes: usize) -> StorageError {
-        StorageError::TooManyEntries(format!(
-            "{path} (a {bytes}-byte WebDAV listing; the limit is {} bytes)",
-            self.max_listing_bytes
-        ))
+    /// How many more listing bytes this storage may take in, or the error when none are left
+    /// (any answer has some, so there's no point asking): what is left to parse, or to
+    /// receive, whichever is less.
+    fn room(&self, path: &str) -> Result<usize, StorageError> {
+        let max = self.max_listing_bytes;
+        let receivable = max
+            .saturating_mul(RECEIVE_FACTOR)
+            .saturating_sub(self.received.get());
+        if receivable == 0 {
+            return Err(StorageError::TooManyEntries(format!(
+                "{path} (not asked for: this request already received {} bytes of WebDAV \
+                 listings, its limit)",
+                self.received.get()
+            )));
+        }
+        match max.saturating_sub(self.parsed.get()) {
+            0 => Err(self.too_many_entries(path, None, 0)),
+            room => Ok(room.min(receivable)),
+        }
+    }
+
+    /// The body of a 207 answer that fits in `room`, which it then uses up.
+    fn take_listing(
+        &self,
+        path: &str,
+        response: TransportResponse,
+        room: usize,
+    ) -> Result<Vec<u8>, StorageError> {
+        if response.truncated || response.body.len() > room {
+            let size = (!response.truncated).then_some(response.body.len());
+            return Err(self.too_many_entries(path, size, room));
+        }
+        self.parsed.set(self.parsed.get() + response.body.len());
+        Ok(response.body)
+    }
+
+    /// The error for a listing of `bytes` (unknown when the transport stopped reading) that
+    /// doesn't fit in `room`.
+    fn too_many_entries(&self, path: &str, bytes: Option<usize>, room: usize) -> StorageError {
+        let max = self.max_listing_bytes;
+        let limit = if room < max {
+            format!("the {room} bytes left of the {max}-byte limit")
+        } else {
+            format!("the {max}-byte limit")
+        };
+        let listing = match bytes {
+            Some(bytes) => format!("a {bytes}-byte WebDAV listing"),
+            None => "a WebDAV listing".into(),
+        };
+        StorageError::TooManyEntries(format!("{path} ({listing}, over {limit})"))
     }
 
     /// A Depth 1 PROPFIND answer for `path`, not yet parsed.
     async fn fetch_listing(&self, path: &str) -> Result<Vec<u8>, StorageError> {
-        let response = self.propfind(path, "1").await?;
+        let room = self.room(path)?;
+        let response = self.propfind(path, "1", room).await?;
         if response.status != 207 {
             return Err(status_error(response.status, "PROPFIND", path));
         }
-        Ok(response.body)
+        self.take_listing(path, response, room)
     }
 
     /// The direct children of `path` in its Depth 1 PROPFIND answer.
@@ -211,7 +300,7 @@ impl<T: Transport> WebDavStorage<T> {
     }
 
     /// Breadth-first search with Depth 1 listings, for servers that refuse Depth: infinity.
-    /// The listings share one `max_listing_bytes` budget, as the single answer would.
+    /// The listings draw on the same `max_listing_bytes` as the single answer would.
     async fn walk(
         &self,
         root: &str,
@@ -221,22 +310,21 @@ impl<T: Transport> WebDavStorage<T> {
         let mut queue = VecDeque::from([root.to_owned()]);
         let mut found = Vec::new();
         let mut requests = 0;
-        let mut parsed = 0;
         while let Some(dir) = queue.pop_front() {
             if requests >= self.walk_budget {
                 break;
             }
             requests += 1;
             let listing = self.fetch_listing(&dir).await;
-            if let Ok(body) = &listing {
-                parsed += body.len();
-                if parsed > self.max_listing_bytes {
-                    return Err(self.too_many_entries(root, parsed));
-                }
-            }
             let children = match listing.and_then(|body| self.children(&dir, &body)) {
                 Ok(children) => children,
                 Err(e) if dir == root => return Err(e),
+                Err(StorageError::TooManyEntries(_)) => {
+                    return Err(StorageError::TooManyEntries(format!(
+                        "{root} (its WebDAV listings together are over the {}-byte limit)",
+                        self.max_listing_bytes
+                    )));
+                }
                 // An unreadable subfolder shouldn't sink the whole search.
                 Err(_) => continue,
             };
@@ -259,16 +347,21 @@ impl<T: Transport> WebDavStorage<T> {
 impl<T: Transport> Storage for WebDavStorage<T> {
     async fn list(&self, path: &str) -> Result<Vec<Entry>, StorageError> {
         let body = self.fetch_listing(path).await?;
-        if body.len() > self.max_listing_bytes {
-            return Err(self.too_many_entries(path, body.len()));
-        }
         self.children(path, &body)
     }
 
     async fn stat(&self, path: &str) -> Result<Entry, StorageError> {
-        let response = self.propfind(path, "0").await?;
+        // One entry: tiny, so it doesn't count against the listing budget, but bounded all the
+        // same in case a server answers with far more.
+        let response = self.propfind(path, "0", self.max_listing_bytes).await?;
         if response.status != 207 {
             return Err(status_error(response.status, "PROPFIND", path));
+        }
+        if response.truncated {
+            return Err(StorageError::Backend(format!(
+                "the WebDAV answer for {path} is over {} bytes",
+                self.max_listing_bytes
+            )));
         }
         let mut found = None;
         self.parse(
@@ -296,7 +389,7 @@ impl<T: Transport> Storage for WebDavStorage<T> {
         }
         let last = range.offset.saturating_add(range.length - 1);
         let headers = vec![("Range".into(), format!("bytes={}-{last}", range.offset))];
-        let response = self.send("GET", path, headers, Vec::new()).await?;
+        let response = self.send("GET", path, headers, Vec::new(), None).await?;
         match response.status {
             206 => {
                 // Servers may answer with a range that starts earlier than asked; anything
@@ -341,20 +434,19 @@ impl<T: Transport> Storage for WebDavStorage<T> {
         }
         let mut matcher = NameMatcher::new(query);
         // One request for the whole tree when the server allows it (rclone does).
-        let response = self.propfind(root, "infinity").await?;
+        let room = self.room(root)?;
+        let response = self.propfind(root, "infinity", room).await?;
         match response.status {
             207 => {}
             // RFC 4918 lets servers refuse infinite depth with 403; others say 400 or 501.
             400 | 403 | 501 => return self.walk(root, &mut matcher, limit).await,
             status => return Err(status_error(status, "PROPFIND", root)),
         }
-        if response.body.len() > self.max_listing_bytes {
-            return Err(self.too_many_entries(root, response.body.len()));
-        }
+        let body = self.take_listing(root, response, room)?;
         let mut root_is_file = false;
         let mut found = Vec::new();
         self.parse(
-            &response.body,
+            &body,
             // Only matches (and the root, to tell a file from a folder) become entries.
             |path, name| path == root || matcher.matches(name),
             |entry| {
@@ -418,7 +510,8 @@ mod tests {
 
     use super::*;
 
-    /// Answers from a script and records what was sent.
+    /// Answers from a script and records what was sent. It honours `max_response_bytes` as
+    /// the Worker's transports do.
     #[derive(Default)]
     struct FakeTransport {
         answers: RefCell<VecDeque<TransportResponse>>,
@@ -436,11 +529,30 @@ mod tests {
 
     impl Transport for FakeTransport {
         async fn send(&self, request: TransportRequest) -> Result<TransportResponse, String> {
+            let max = request.max_response_bytes;
             self.sent.borrow_mut().push(request);
-            self.answers
+            let mut answer = self
+                .answers
                 .borrow_mut()
                 .pop_front()
-                .ok_or_else(|| "connection refused".to_owned())
+                .ok_or_else(|| "connection refused".to_owned())?;
+            if let Some(max) = max
+                && answer.body.len() > max
+            {
+                answer.body.truncate(max);
+                answer.truncated = true;
+            }
+            Ok(answer)
+        }
+    }
+
+    /// A transport that reads whole bodies whatever the limit, as the contract allows.
+    struct Unbounded(FakeTransport);
+
+    impl Transport for Unbounded {
+        async fn send(&self, mut request: TransportRequest) -> Result<TransportResponse, String> {
+            request.max_response_bytes = None;
+            self.0.send(request).await
         }
     }
 
@@ -452,6 +564,7 @@ mod tests {
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
             body: body.to_vec(),
+            truncated: false,
         }
     }
 
@@ -798,24 +911,162 @@ mod tests {
 
     #[test]
     fn listings_over_the_byte_limit_are_not_parsed() {
+        let max = ROOT_DEPTH1.len() - 1;
         let s = storage(vec![
             answer(207, &[], ROOT_DEPTH1),
             answer(207, &[], ROOT_INFINITY),
             answer(207, &[], ROOT_DEPTH1),
         ])
-        .with_max_listing_bytes(ROOT_DEPTH1.len() - 1);
+        .with_max_listing_bytes(max);
         let err = block(s.list("/")).unwrap_err();
-        assert!(matches!(err, StorageError::TooManyEntries(_)), "{err:?}");
-        let text = err.to_string();
-        assert!(
-            text.contains(&format!("{}-byte", ROOT_DEPTH1.len())),
-            "{text}"
+        assert_eq!(
+            err,
+            StorageError::TooManyEntries(format!(
+                "/ (a WebDAV listing, over the {max}-byte limit)"
+            ))
         );
         let err = block(s.search("/", "leaf", 10)).unwrap_err();
         assert!(matches!(err, StorageError::TooManyEntries(_)), "{err:?}");
+        // The transport was asked to stop reading at the limit.
+        let sent = s.transport().sent.borrow();
+        assert!(sent.iter().all(|r| r.max_response_bytes == Some(max)));
+        drop(sent);
         // At the limit is fine.
-        let s = s.with_max_listing_bytes(ROOT_DEPTH1.len());
+        let s =
+            storage(vec![answer(207, &[], ROOT_DEPTH1)]).with_max_listing_bytes(ROOT_DEPTH1.len());
         assert_eq!(block(s.list("/")).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn a_truncated_answer_is_too_many_entries_whatever_its_size() {
+        // A transport that stopped reading says so; the start it kept is never parsed.
+        let mut cut = answer(207, &[], &ROOT_INFINITY[..100]);
+        cut.truncated = true;
+        let s = storage(vec![cut.clone(), cut]);
+        let err = block(s.search("/", "leaf", 10)).unwrap_err();
+        assert_eq!(
+            err,
+            StorageError::TooManyEntries(format!(
+                "/ (a WebDAV listing, over the {DEFAULT_MAX_LISTING_BYTES}-byte limit)"
+            ))
+        );
+        assert!(matches!(
+            block(s.list("/")).unwrap_err(),
+            StorageError::TooManyEntries(_)
+        ));
+        // A transport that ignores the limit is caught by the size check instead.
+        let s = WebDavStorage::new(
+            Unbounded(FakeTransport::answering(vec![answer(
+                207,
+                &[],
+                ROOT_INFINITY,
+            )])),
+            "mcp",
+            "pw",
+        )
+        .with_max_listing_bytes(100);
+        let err = block(s.search("/", "leaf", 10)).unwrap_err();
+        assert_eq!(
+            err,
+            StorageError::TooManyEntries(format!(
+                "/ (a {}-byte WebDAV listing, over the 100-byte limit)",
+                ROOT_INFINITY.len()
+            ))
+        );
+    }
+
+    #[test]
+    fn only_propfind_bodies_are_bounded() {
+        let s = storage(vec![
+            answer(207, &[], FILE_DEPTH0),
+            answer(206, &[("Content-Range", "bytes 0-4/100")], b"01234"),
+        ]);
+        block(s.stat("/Café menu.txt")).unwrap();
+        block(s.read(
+            "/Café menu.txt",
+            ByteRange {
+                offset: 0,
+                length: 5,
+            },
+        ))
+        .unwrap();
+        let sent = s.transport().sent.borrow();
+        assert_eq!(sent[0].max_response_bytes, Some(DEFAULT_MAX_LISTING_BYTES));
+        // GET bodies are bounded by their Range instead.
+        assert_eq!(sent[1].max_response_bytes, None);
+    }
+
+    #[test]
+    fn one_storage_parses_at_most_the_limit_in_all() {
+        let listing = || answer(207, &[], ROOT_DEPTH1);
+        let max = ROOT_DEPTH1.len() * 2 - 1;
+        let s = storage(vec![listing(), listing(), listing()]).with_max_listing_bytes(max);
+        assert_eq!(block(s.list("/")).unwrap().len(), 6);
+        // The second listing gets only what is left, and doesn't fit in it.
+        let left = max - ROOT_DEPTH1.len();
+        let err = block(s.list("/")).unwrap_err();
+        assert_eq!(
+            err,
+            StorageError::TooManyEntries(format!(
+                "/ (a WebDAV listing, over the {left} bytes left of the {max}-byte limit)"
+            ))
+        );
+        assert_eq!(
+            s.transport().sent.borrow()[1].max_response_bytes,
+            Some(left)
+        );
+        // Stats don't count.
+        let s = storage(vec![listing(), answer(207, &[], FILE_DEPTH0), listing()])
+            .with_max_listing_bytes(ROOT_DEPTH1.len());
+        block(s.list("/")).unwrap();
+        block(s.stat("/Café menu.txt")).unwrap();
+        // With nothing left, a listing isn't even asked for.
+        assert!(matches!(
+            block(s.search("/", "x", 10)).unwrap_err(),
+            StorageError::TooManyEntries(_)
+        ));
+        assert_eq!(s.transport().sent.borrow().len(), 2);
+    }
+
+    #[test]
+    fn answers_too_big_to_parse_still_use_up_a_receive_budget() {
+        // A split search asks for one oversized subfolder after another; each answer is cut
+        // off and refused, but what came in counts.
+        let max = 1000;
+        let big = || answer(207, &[], &vec![b' '; max * 3]);
+        let s = storage((0..10).map(|_| big()).collect()).with_max_listing_bytes(max);
+        for i in 0..10 {
+            let err = block(s.search(&format!("/sub{i}"), "x", 10)).unwrap_err();
+            assert!(matches!(err, StorageError::TooManyEntries(_)), "{err:?}");
+        }
+        let sent = s.transport().sent.borrow();
+        let asked: usize = sent.iter().map(|r| r.max_response_bytes.unwrap()).sum();
+        assert_eq!(sent.len(), 2, "only two answers fit in the receive budget");
+        assert!(asked <= RECEIVE_FACTOR * max, "asked for {asked} bytes");
+        drop(sent);
+        // Once spent, nothing more is asked for, a listing included.
+        let err = block(s.list("/")).unwrap_err();
+        assert_eq!(
+            err,
+            StorageError::TooManyEntries(
+                "/ (not asked for: this request already received 2000 bytes of WebDAV \
+                 listings, its limit)"
+                    .into()
+            )
+        );
+        assert_eq!(s.transport().sent.borrow().len(), 2);
+
+        // A transport that ignores the limit is charged what it actually read.
+        let s = WebDavStorage::new(
+            Unbounded(FakeTransport::answering((0..10).map(|_| big()).collect())),
+            "mcp",
+            "pw",
+        )
+        .with_max_listing_bytes(max);
+        for i in 0..10 {
+            let _ = block(s.search(&format!("/sub{i}"), "x", 10));
+        }
+        assert_eq!(s.transport().0.sent.borrow().len(), 1);
     }
 
     #[test]
@@ -831,12 +1082,63 @@ mod tests {
         assert_eq!(
             err,
             StorageError::TooManyEntries(format!(
-                "/ (a {}-byte WebDAV listing; the limit is {limit} bytes)",
-                limit + b.body.len()
+                "/ (its WebDAV listings together are over the {limit}-byte limit)"
             ))
         );
+        // The budget was spent on / and /a, so /b was never asked for.
+        assert_eq!(s.transport().sent.borrow().len(), 3);
         let s = storage(vec![refuse(), root, a, b]).with_max_listing_bytes(limit + 1000);
         assert_eq!(block(s.search("/", "match", 10)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_matches_names_exactly_as_the_core_does() {
+        // search_files matches names it lists itself with pcloud_mcp_core::name_matches, so a
+        // search split around a turned-off folder must agree with this backend's search.
+        let hrefs = [
+            "/Cafe%CC%81%20menu.txt",
+            "/Caf%C3%A9%20bill.txt",
+            "/CAFETERIA/",
+            "/stra%C3%9Fe.txt",
+            "/%E3%81%8B%E3%82%99%E3%82%93.txt",
+            "/Na%C3%AFve%20notes.md",
+            "/plain.txt",
+            "/e%CC%81.txt",
+        ];
+        let names: Vec<String> = hrefs
+            .iter()
+            .map(|h| {
+                let path = paths::href_to_path(h, "").unwrap();
+                paths::file_name(&path).to_owned()
+            })
+            .collect();
+        for query in [
+            "cafe",
+            "CAF\u{c9}",
+            "e\u{301}",
+            "\u{1e9e}",
+            "\u{304c}",
+            "naive",
+            "NA\u{cf}V",
+            ".TXT",
+            "\u{301}",
+            "zzz",
+        ] {
+            let s = storage(vec![depth1("/", &hrefs)]);
+            let mut backend: Vec<String> = block(s.search("/", query, 100))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            let mut core: Vec<String> = names
+                .iter()
+                .filter(|name| pcloud_mcp_core::name_matches(query, name))
+                .cloned()
+                .collect();
+            backend.sort();
+            core.sort();
+            assert_eq!(backend, core, "query {query:?}");
+        }
     }
 
     #[test]
