@@ -1,0 +1,37 @@
+# The core's config in the cluster, mounted at /etc/chance-of-files/config.toml. It follows
+# config.example.toml at the repo root (every option is documented there); keep the two in step.
+# Secrets never go here: INTERNAL_TOKEN and RC_PASS come from the Secret as env vars.
+# An overlay replaces this whole file (configMapGenerator, behavior: replace).
+
+[server]
+# Loopback only: the tunnel (cloudflared in the same pod) is the one way in.
+listen = "127.0.0.1:8080"
+# Longest a tool call may take before it returns what it has. 200 s was measured to pass through
+# the whole Cloudflare path; Claude itself gives up at 240 s.
+deadline = "180s"
+# Browser origins allowed to send an Origin header; requests without one (the auth Worker) pass.
+allowed_origins = ["https://claude.ai", "https://claude.com"]
+
+[rclone]
+url = "http://127.0.0.1:5572"
+user = "core"
+# The remote the rclone container defines from env vars (RCLONE_CONFIG_PCLOUD_*).
+remote = "pcloud"
+
+[policy]
+# Never listed, read or searched; errors say "not found". pCloud's client-side encrypted folder
+# is the obvious one. Paths are absolute and match the folder and everything under it.
+hidden = ["/Crypto Folder"]
+# Visible and readable, never written (enforced once write tools exist).
+protected = []
+# Folders search_files goes around, for huge trees such as a photo backup.
+search_skip = []
+
+[guide]
+# The first 8 KiB of this file go into the instructions Claude gets when it connects.
+path = "/AGENTS.md"
+
+[limits]
+max_read_bytes = 100_000      # text per read_text_file call, under Claude's ~150k-character cap
+max_image_bytes = 1_572_864   # 1.5 MiB, before base64
+max_listing_bytes = 64_000_000 # one rclone listing; a 133k-entry recursive listing is ~35 MB

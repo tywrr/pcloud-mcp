@@ -23,6 +23,9 @@ strong, code { color: var(--fg); overflow-wrap: anywhere; }
 .error { color: var(--warn); font-weight: 600; }
 ul { margin: 0 0 16px; padding-left: 20px; color: var(--muted); }
 label { display: block; margin: 16px 0 6px; font-weight: 600; }
+.choice { display: flex; gap: 10px; align-items: flex-start; margin: 16px 0 0; font-weight: 400; }
+.choice input { margin-top: 4px; }
+.choice small { display: block; color: var(--muted); }
 input[type=password] { width: 100%; padding: 10px; font: inherit; color: var(--fg);
   background: transparent; border: 1px solid var(--line); border-radius: 6px; }
 .row { display: flex; gap: 12px; margin-top: 16px; }
@@ -49,7 +52,7 @@ ${body}
 
 export interface SignInPage {
 	details: ConsentDescription;
-	/** The scopes that approving will grant. */
+	/** The scopes that approving grants; the write box, always unticked here, adds files:write. */
 	scopes: string[];
 	error?: string;
 }
@@ -72,14 +75,16 @@ export function signInPage(nonce: string, { details, scopes, error }: SignInPage
 	return layout(
 		nonce,
 		`Allow ${details.clientName}?`,
-		`<h1>Allow ${name} to read your pCloud files?</h1>
+		`<h1>Allow ${name} to use your pCloud files?</h1>
 ${who}
 <p>Access will be sent to <strong>${escapeHtml(details.redirectHost)}</strong>.</p>
 ${local}
-<p>It gets read-only access to the folder this server shares:</p>
+<p>It gets read access to the files this server shares:</p>
 <ul>${scopeList}</ul>
 ${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}
 <form method="post">
+<label class="choice"><input type="checkbox" name="allow_write" value="yes">
+<span>Also allow changes (create, move, upload, delete)<small>Adds <code>files:write</code>. Deletes go to pCloud's trash. To change this later, reconnect.</small></span></label>
 <label for="passphrase">Owner passphrase</label>
 <input id="passphrase" type="password" name="passphrase" autocomplete="current-password" required autofocus>
 <div class="row">

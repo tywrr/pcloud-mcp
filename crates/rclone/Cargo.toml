@@ -1,0 +1,22 @@
+[package]
+name = "chance-of-files-rclone"
+description = "Chance of Files storage backend over rclone's remote-control API (rclone rcd)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chance-of-files-core.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+axum = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "process"] }

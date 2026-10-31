@@ -4,34 +4,34 @@
 
 Let **Claude** read the files in your **pCloud**: text and images, from claude.ai, the Claude apps, Claude Code and **Claude Duet**, through a custom connector you host yourself.
 
-pCloud has an [official MCP server](https://mcp.pcloud.com/mcp), and it's good at organizing files, but none of its tools return what's inside one. Chance of Files fills that gap: Claude can list, search and read text files and images in one pCloud folder you choose, or the whole drive. It's read-only for now.
+pCloud has an [official MCP server](https://mcp.pcloud.com/mcp), and it's good at organizing files, but none of its tools return what's inside one. Chance of Files fills that gap: Claude can list, search and read text files and images anywhere in your drive, except the folders you hide. It's read-only in 0.2; writes, a whole-drive index and download links are on the [roadmap](docs/roadmap.md).
 
-It's a remote MCP server on Cloudflare Workers: a Rust Worker with the tools, behind a small TypeScript Worker that handles OAuth. The free plan runs it for a focused folder of up to about a thousand files; see [limitations](#limitations). You add it in claude.ai like any other connector and approve it with a passphrase only you know. Claude Duet uses the connectors on your claude.ai account, so Duet gets it too.
+It has two halves:
+
+- **The core**, a Rust server (`chance-of-files`) that runs next to `rclone rcd` and `cloudflared` in one pod on any Kubernetes or k3s node you have (a NAS, a mini PC, a Raspberry Pi 5), or as three containers on a plain Docker host. rclone talks to pCloud's API with its own registered app, so no pCloud Drive mount and no laptop are involved.
+- **The auth Worker**, a small TypeScript Worker on Cloudflare's **free** plan. It's the URL you add to Claude; it handles OAuth and forwards requests to the core through a Workers VPC service and a Cloudflare Tunnel that has no public hostname. Nothing on your network listens to the internet.
 
 Chance of Files is an independent, self-hosted project. It is not affiliated with, endorsed by or supported by pCloud or Anthropic; "pCloud" and "Claude" are their owners' trademarks, used here only to say what this works with.
 
 ## Status
 
-**Proof of concept**, October 2026. pCloud removed password sign-in from its API in April 2026, and an OAuth app has to be approved by pCloud by hand; this project's request is pending. Until then, Chance of Files reads pCloud the long way round, through the [pCloud Drive](https://www.pcloud.com/download-free-online-cloud-file-storage.html) mount on your laptop:
+**0.2 (in progress), October 2026.** The core moved off Cloudflare Workers onto your own machine ([design](docs/design/v2.md)); the five read tools are the same as in 0.1. pCloud removed password sign-in from its API in April 2026 and approves OAuth apps by hand; this project's request is pending, so the core reaches pCloud through rclone's remote-control API with an rclone `pcloud` remote you authorise once.
 
-Claude → two Workers → Cloudflare Tunnel → your laptop → `rclone serve webdav --read-only` → `~/pCloudDrive/<folder>` → pCloud
-
-So the laptop has to be on, awake and running pCloud Drive. A backend that calls the pCloud API directly, with no laptop involved, comes once an app is approved; the tools are written against a storage trait so it drops in. See the [roadmap](docs/roadmap.md).
+**0.1 (Workers only)** ran the core as a second Worker and read pCloud through the pCloud Drive mount on a laptop. It's frozen at tag [`v0.1.0`](https://github.com/tywrr/chance-of-files/tree/v0.1.0); its README and setup guide are there.
 
 ## Chance of Files or pCloud's own MCP server?
 
-| | [pCloud MCP](https://mcp.pcloud.com/mcp) (official) | Chance of Files |
+| | [pCloud MCP](https://mcp.pcloud.com/mcp) (official) | Chance of Files 0.2 |
 |---|---|---|
-| Hosted by | pCloud | You: two Workers on your Cloudflare account, plus your laptop for now |
+| Hosted by | pCloud | You: a pod on your own machine, plus a free Cloudflare Worker |
 | List folders, search names, file info | Yes | Yes |
 | Read text files | No | Yes, up to 100 kB per call, with offsets for longer files |
 | Read images | No | Yes, up to 1.5 MiB by default |
-| Create, copy, move, rename, upload, public links | Yes | No (read-only for now) |
-| Delete | No | No |
-| What Claude can reach | Your whole account | One folder you choose, or the whole drive minus what you filter out |
-| Works with your laptop off | Yes | Not yet |
+| Create, copy, move, rename, upload, public links | Yes | Not yet (0.4, behind a separate `files:write` consent) |
+| Delete | No | Not yet (0.4, to pCloud's trash only) |
+| What Claude can reach | Your whole account | Your whole drive minus the paths you hide |
 
-They don't conflict. Add both, and Claude organizes with pCloud's and reads with this one. Serve the whole drive and the paths match too, so Claude can find a file with one and read it with the other.
+They don't conflict. Add both, and Claude organizes with pCloud's and reads with this one; the paths match.
 
 ## Tools
 
@@ -39,95 +39,94 @@ They don't conflict. Add both, and Claude organizes with pCloud's and reads with
 |---|---|---|
 | `list_folder` | `path` (default `/`) | The folder's files and subfolders, with sizes and modified times |
 | `get_file_info` | `path` | Name, type, size, modified time and content type of one file or folder |
-| `read_text_file` | `path`, `offset` (default 0), `max_bytes` | Text from `offset`, at most `MAX_READ_BYTES` (100,000) bytes per call; Claude calls again with a later offset to read on |
-| `read_image` | `path` | The image itself (PNG, JPEG, GIF or WebP), if it's at most `MAX_IMAGE_BYTES` (1.5 MiB) |
-| `search_files` | `query`, `path` (default `/`), `limit` | Files and folders under `path` whose **name** contains `query`, ignoring case and accents, at most `SEARCH_LIMIT` (50). It goes around folders you turn off with `SEARCH_SKIP` |
+| `read_text_file` | `path`, `offset` (default 0), `max_bytes` | Text from `offset`, at most `limits.max_read_bytes` (100,000) bytes per call; Claude calls again with a later offset to read on |
+| `read_image` | `path` | The image itself (PNG, JPEG, GIF or WebP), if it's at most `limits.max_image_bytes` (1.5 MiB) |
+| `search_files` | `query`, `path` (default `/`), `limit` | Files and folders under `path` whose **name** contains `query`, ignoring case and accents. It goes around the folders in `policy.search_skip` |
 
-Paths are relative to the folder you serve: `/` is its root, and `..` is rejected. An `AGENTS.md` at that root, if you write one, goes into the instructions Claude gets when it connects: say there what each folder is for ([setup](docs/setup.md#serving-the-whole-drive)).
+All five need only the `files:read` scope, which every sign-in grants. An `/AGENTS.md` at the root of your drive, if you write one, goes into the instructions Claude gets when it connects: say there what each folder is for.
 
 ## How it works
 
 ```mermaid
 flowchart LR
   claude["Claude<br/>claude.ai, apps, Duet, Claude Code"]
-  subgraph cf["Cloudflare Workers (your account)"]
-    auth["chance-of-files<br/>TypeScript: OAuth, /mcp proxy"]
+  subgraph cf["Cloudflare (free plan)"]
+    auth["chance-of-files Worker<br/>TypeScript: OAuth, /mcp proxy"]
     kv[("OAUTH_KV")]
-    core["chance-of-files-core<br/>Rust: MCP tools<br/>no public URL"]
+    vpc["Workers VPC service<br/>→ tunnel → 127.0.0.1:8080"]
   end
-  subgraph laptop["Your laptop"]
-    cfd["cloudflared<br/>outbound only"]
-    rclone["rclone serve webdav<br/>127.0.0.1:8080, read-only"]
-    drive["pCloud Drive mount<br/>~/pCloudDrive/Library"]
+  subgraph pod["Pod chance-of-files (your machine)"]
+    cfd["cloudflared<br/>outbound QUIC"]
+    core["chance-of-files<br/>Rust, 127.0.0.1:8080"]
+    rclone["rclone rcd<br/>127.0.0.1:5572"]
   end
-  pcloud[("pCloud")]
-  claude -- "HTTPS + OAuth token" --> auth
+  pcloud[("pCloud API")]
+  claude -- "MCP + OAuth token" --> auth
   auth --- kv
-  auth -- "service binding<br/>Bearer INTERNAL_TOKEN" --> core
-  core -- "Workers VPC binding<br/>HTTP Basic auth" --> cfd
-  cfd --> rclone --> drive --> pcloud
+  auth -- "Bearer INTERNAL_TOKEN<br/>X-CoF-Scopes" --> vpc --> cfd --> core
+  core -- "rc JSON, ranged reads" --> rclone --> pcloud
 ```
 
-1. Claude calls `https://chance-of-files.<your-subdomain>.workers.dev/mcp` with an OAuth access token. The auth Worker checks it, swaps it for the internal token and forwards the request over a service binding.
-2. The core Worker answers MCP (Streamable HTTP, stateless JSON-RPC) and runs the tool, which reads through the `Storage` trait: here WebDAV `PROPFIND` and ranged `GET`.
-3. Those requests reach your laptop through a Workers VPC binding and a Cloudflare Tunnel that has no public hostname. rclone serves the folder read-only, and pCloud Drive fetches file contents from pCloud on demand.
+1. Claude calls `https://chance-of-files.<your-subdomain>.workers.dev/mcp` with an OAuth access token. The auth Worker checks it, replaces it with the internal token, adds the grant's scopes as `X-CoF-Scopes`, and forwards the request over its VPC service binding.
+2. The binding reaches the pod through a Cloudflare Tunnel; cloudflared hands the request to the core on loopback.
+3. The core checks the internal token, applies your path policy (hidden folders never reach rclone), runs the tool and calls rclone's remote-control API, which calls pCloud.
 
 [docs/architecture.md](docs/architecture.md) has the details and the reasons.
 
 ## Security model
 
-- **Only you can connect.** The sign-in page asks for `OWNER_PASSPHRASE`, 32 random characters if you follow the setup; there are no accounts. The passphrase is the defence: attempts are rate limited per address (per `/64` for IPv6), which slows guessing from one place but not from many. Claude gets tokens for this server's `/mcp` only, refresh tokens rotate, and the KV store keeps only token hashes.
-- **Strangers can't write much.** Showing the sign-in page writes nothing, and neither does a wrong passphrase. Dynamic Client Registration (`POST /register`) is accepted only from `DCR_ALLOWED_CIDRS`: by default only loopback, for local development. Claude and Claude Code identify themselves with a Client ID Metadata Document instead and don't register at all; a client that registers instead, such as the MCP Inspector, needs `DCR_ALLOWED_CIDRS="*"` for the minute it takes them to register ([setup](docs/setup.md#11-add-the-connector-in-claude)).
-- **The core Worker has no public URL** (`workers_dev = false`). Only the auth Worker can call it, over the service binding, and it still checks `INTERNAL_TOKEN` (constant-time) on every request. Claude's tokens never reach it.
-- **Your laptop opens no ports.** cloudflared connects out, the tunnel has no public hostname, and only Workers bound to its VPC service can send requests through it. rclone listens on `127.0.0.1` only, requires Basic auth, serves one folder, and is read-only.
-- **Read-only twice over.** No tool writes, and rclone would refuse if one tried.
+- **Only you can connect.** The sign-in page asks for a passphrase only you know; there are no accounts. Attempts are rate limited, Claude gets tokens for this server's `/mcp` only, refresh tokens rotate, and the KV store keeps only token hashes.
+- **Read and write are separate grants.** Every sign-in gets `files:read`; `files:write` only when you tick an unticked-by-default box on the consent page. 0.2 has no write tools, but the core already filters `tools/list` by scope and refuses calls whose scope is missing.
+- **Nothing listens on your network.** cloudflared dials out; the tunnel has no public hostname and is reachable only from Workers bound to its VPC service. The core and rclone listen on the pod's loopback, a NetworkPolicy denies all ingress, and the pod runs under the `restricted` Pod Security profile (non-root, read-only root filesystem, no capabilities, no service-account token, no hostPath).
+- **Hidden paths are enforced in one place.** The core's `policy.hidden` list is checked on normalized paths before any rclone call; rclone itself runs with no filters (they don't stop single-object calls, and they'd slow listings down; see [phase 0](docs/design/phase0-rclone.md)). Hide your Crypto Folder and anything else Claude shouldn't see.
+- **The internal token is the core's only door.** The core refuses every `/mcp` request without it (constant-time compare) and trusts `X-CoF-Scopes` only on requests that carry it. rclone's rc password never leaves the pod.
 
 What it doesn't protect against:
 
-- **Anything in the served folder can reach Claude.** Don't serve folders with IDs, tax papers or password exports. When you serve the whole drive, hide them with rclone's filter file, and hide the Crypto Folder too: it's unreadable while locked, but pCloud Drive shows it in plain text whenever it's unlocked.
+- **Anything not hidden can reach Claude.** Hide IDs, tax papers and password exports, or keep them outside pCloud.
 - **File contents are untrusted input.** A file can contain instructions aimed at Claude (prompt injection). Read-only tools limit what that can do.
 - **Cloudflare and Anthropic see the traffic.** TLS ends at Cloudflare's edge, as with any Worker, and tool results pass through Anthropic, as with any connector.
 
 ## Limitations
 
-- **Your laptop must be on, awake, online and running pCloud Drive.** While it sleeps, tools fail with a backend error.
-- **The Workers free plan allows 10 ms of CPU per request.** Waiting on the laptop doesn't count, but parsing listings and encoding images does. On the free plan, `search_files` stays under it up to roughly 1,000 entries under the path it searches (the whole served folder by default), `list_folder` up to roughly 1,000 to 1,500 entries in one folder, and `read_image` up to about 1.5 MiB, the default `MAX_IMAGE_BYTES`. A listing bigger than `MAX_LISTING_BYTES` (400,000 bytes) fails cleanly, as a tool error that tells Claude to narrow the path, instead of running out of CPU. So serve a focused folder, or serve the whole drive and list its huge folders (a photo backup, say) in `SEARCH_SKIP`: searches then go around them, and Claude browses them with `list_folder` ([Serving the whole drive](docs/setup.md#serving-the-whole-drive)). [Workers Paid](https://developers.cloudflare.com/workers/platform/pricing/) ($5 a month, 30 s of CPU per request) lifts this; raise `MAX_LISTING_BYTES` and `MAX_IMAGE_BYTES` there. The free plan's other limits (128 MB memory, 50 subrequests per request, 100,000 requests and 1,000 KV writes a day) are plenty for one person.
-- **Claude's limits:** a tool result is capped at about 150,000 characters (which is why reads are paged) and a call at 240 seconds.
-- **Claude Duet is a research preview** (US Pro and Max, since 2026-10-21). It uses your claude.ai connectors when you talk to it; its scheduled and background runs may skip custom connectors.
-- **claude.ai sometimes doesn't finish adding a custom connector, or hides its tools** even when it shows Connected ([anthropics/claude-ai-mcp#831](https://github.com/anthropics/claude-ai-mcp/issues/831), [#476](https://github.com/anthropics/claude-ai-mcp/issues/476)). The desktop and mobile apps and Claude Code usually work when the web doesn't; see [troubleshooting](docs/setup.md#sign-in-succeeds-but-the-card-stays-on-connect-or-the-tools-never-appear).
-- **Text and images only, names only.** PDFs and Office files come later, and search matches names, not contents.
+- **A machine that runs containers, always on.** A single-node k3s on a NAS is the reference setup; any Kubernetes works, and so does Docker (see [setup](docs/setup.md#running-on-plain-docker)). At rest the pod uses roughly 150 MB of RAM (rclone idles at about 85 MB).
+- **Workers VPC is free while it's in beta.** If that changes, the fallback is a tunnel public hostname behind Cloudflare Access ([design, Risks](docs/design/v2.md#risks)).
+- **Claude's limits:** a tool result is capped at about 150,000 characters (reads are paged) and a call at 240 seconds; the core stops at 180 s (`server.deadline`).
+- **Claude Duet is a research preview.** It uses your claude.ai connectors when you talk to it; its scheduled and background runs may skip custom connectors.
+- **claude.ai sometimes doesn't finish adding a custom connector, or hides its tools** even when it shows Connected ([anthropics/claude-ai-mcp#831](https://github.com/anthropics/claude-ai-mcp/issues/831), [#476](https://github.com/anthropics/claude-ai-mcp/issues/476)). See [troubleshooting](docs/setup.md#troubleshooting).
+- **Text and images only, names only.** PDFs, Office files, mail and full-text search come in 0.5.
 
 ## Documentation
 
 | Doc | Read it for |
 |---|---|
-| [Setup](docs/setup.md) | Running your own: rclone and cloudflared on the laptop, the tunnel, both Workers, the connector in Claude, troubleshooting |
-| [Development](docs/development.md) | The local loop, tests, Claude Code and MCP Inspector, a separate dev deployment |
-| [Architecture](docs/architecture.md) | Components, request flow, the auth layers, limits, why Rust plus TypeScript |
-| [Background](docs/background.md) | Why this exists, prior art, pCloud API gotchas, alternatives considered |
-| [Roadmap](docs/roadmap.md) | pCloud API backend, write tools, more file types |
+| [Setup](docs/setup.md) | Running your own: the rclone remote, the tunnel and VPC service, the image, the pod, the auth Worker, the connector in Claude |
+| [Development](docs/development.md) | The local loop, tests, building images, Claude Code and MCP Inspector |
+| [Architecture](docs/architecture.md) | Components, request flow, auth layers and scopes, the config file, limits |
+| [Roadmap](docs/roadmap.md) | Index and audit tools, writes and links, mirror and full text, the pCloud API backend |
+| [Design v2](docs/design/v2.md) | The full v2 design and the phase 0 measurements behind it |
+| [Background](docs/background.md) | Why this exists, prior art, pCloud API gotchas (written for 0.1) |
 
 ## Development
 
 ```bash
-mise install                                                 # node 26 and wrangler, pinned
-cp crates/worker/.dev.vars.example crates/worker/.dev.vars
-mise run backend      # terminal 1: rclone serves fixtures/webdav-root on 127.0.0.1:8081
-mise run dev          # terminal 2: the core Worker on http://127.0.0.1:8787/mcp
-mise run smoke        # terminal 3: tools/list and every tool through the MCP Inspector CLI
+mise install          # node, wrangler, rclone (Rust comes from rustup)
+mise run dev          # rclone rcd over fixtures/webdav-root + the server on http://127.0.0.1:8080/mcp
+mise run smoke        # another terminal: tools/list and every tool through the MCP Inspector CLI
 mise run test         # cargo test --workspace and the auth front's tests
+mise run lint         # fmt, clippy -D warnings, typecheck, shellcheck, kustomize render
+mise run build-image  # static musl binaries -> OCI archives in target/oci
 ```
-
-Rust comes from rustup with the `wasm32-unknown-unknown` target, plus `cargo install worker-build@0.8.7`. [docs/development.md](docs/development.md) has the rest.
 
 | Path | What |
 |---|---|
-| `crates/core` | `chance-of-files-core`: the MCP endpoint, JSON-RPC and tools over the `Storage` trait; no Workers or WebDAV code, so it tests natively |
-| `crates/webdav` | `chance-of-files-webdav`: `Storage` over WebDAV (rclone) |
-| `crates/worker` | `chance-of-files-worker`: the Rust Worker, deployed as `chance-of-files-core` |
+| `crates/core` | The MCP endpoint, JSON-RPC, tools, `Storage` trait, policy and scopes. No I/O of its own |
+| `crates/rclone` | `Storage` over rclone's remote-control API |
+| `crates/webdav` | `Storage` over WebDAV, for a local folder or NAS |
+| `crates/server` | The `chance-of-files` binary: axum, config, `/mcp`, `/healthz`, `/readyz` |
 | `auth/` | The TypeScript Worker `chance-of-files`: OAuth and the `/mcp` proxy |
-| `scripts/`, `fixtures/` | Local WebDAV backend, smoke test, sample file tree |
-| `deploy/systemd/` | User services for rclone and cloudflared |
+| `deploy/` | Kustomize base (`k8s/base`), `k8s/apply.sh`, `build-image.sh`, `oci-image.py`, `dev.sh` |
+| `config.example.toml` | Every config option, documented |
 
 ## License
 

@@ -1,0 +1,23 @@
+# Chance of Files v2 on any Kubernetes or k3s node: one pod with the core, rclone rcd and cloudflared.
+# Render: kubectl kustomize deploy/k8s/base. Apply with deploy/k8s/apply.sh, which also creates the
+# Secret this base expects (it is never part of the manifests).
+#
+# Overlays change the image, config.toml (configMapGenerator, behavior: replace) and the PVC
+# (storage class, size, a pre-made PersistentVolume). See docs/setup.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: chance-of-files
+labels:
+  - pairs: { app.kubernetes.io/part-of: chance-of-files }
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  # The hash suffix kustomize adds makes a config change roll the pod.
+  - name: chance-of-files-config
+    files: [config.toml]
+images:
+  - name: ghcr.io/tywrr/chance-of-files
+    newTag: "0.2.0"

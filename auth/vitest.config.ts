@@ -13,20 +13,11 @@ export default defineConfig({
 	plugins: [
 		cloudflareTest({
 			wrangler: { configPath: "./wrangler.jsonc" },
+			// The CORE VPC binding is remote-only, and tests must never open a Cloudflare session.
+			// Locally it just throws; test/helpers.ts swaps in a stub core instead.
+			remoteBindings: false,
 			miniflare: {
 				bindings: { ...TEST_SECRETS, PUBLIC_URL: "" },
-				// Stands in for the Rust core: echoes what reached it, so tests can check that the
-				// client's token was swapped for INTERNAL_TOKEN.
-				serviceBindings: {
-					MCP_CORE: async (request) =>
-						Response.json({
-							method: request.method,
-							url: request.url,
-							authorization: request.headers.get("Authorization"),
-							cookie: request.headers.get("Cookie"),
-							body: await request.text(),
-						}),
-				},
 			},
 		}),
 	],

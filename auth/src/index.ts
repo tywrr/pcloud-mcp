@@ -1,6 +1,6 @@
 // chance-of-files: the OAuth front of Chance of Files, an MCP server for your pCloud.
 //
-//   /mcp                                     protected; forwarded to the chance-of-files-core Worker
+//   /mcp                                     protected; forwarded to the core over the CORE VPC binding
 //   /authorize                               the owner's passphrase sign-in page
 //   /token                                   OAuth token endpoint (public and client-secret clients)
 //   /register                                Dynamic Client Registration, from DCR_ALLOWED_CIDRS only
@@ -10,7 +10,7 @@
 //
 // Everything else is 404.
 
-import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { OAuthProvider, type OAuthResourceContext, insufficientScope } from "@cloudflare/workers-oauth-provider";
 import { handleAuthorize } from "./authorize";
 import {
 	ACCESS_TOKEN_TTL,
@@ -46,7 +46,15 @@ function build(origin: string, redirectSpec: string | undefined): Built {
 	const policy = new RedirectPolicy(redirectSpec);
 	const provider = new OAuthProvider<Env>({
 		apiRoute: MCP_PATH,
-		apiHandler: { fetch: (request, env) => forwardToCore(request, env) },
+		apiHandler: {
+			fetch: (request, env, executionContext) => {
+				// The provider sets ctx.auth from the token record; its handler type predates that.
+				const ctx = executionContext as OAuthResourceContext<unknown>;
+				// Every grant carries files:read; a token without it was refreshed down to less.
+				if (!ctx.auth.scope.includes(READ_SCOPE)) return insufficientScope(ctx.auth, [READ_SCOPE]);
+				return forwardToCore(request, env, ctx.auth.scope);
+			},
+		},
 		defaultHandler: {
 			fetch: (request, env) => {
 				if (new URL(request.url).pathname === "/authorize") {

@@ -1,6 +1,6 @@
 # Background
 
-Why Chance of Files exists and how its shape was chosen. A decision record, written 2026-10-29.
+Why Chance of Files exists and how its shape was chosen. A decision record, written 2026-10-29 for 0.1 (two Workers and a laptop); some of it, such as the Workers CPU limits, no longer applies since 0.2 moved the core to your own machine. The v2 decisions are in [design/v2.md](design/v2.md).
 
 ## Why build it
 

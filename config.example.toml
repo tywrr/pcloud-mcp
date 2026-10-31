@@ -1,0 +1,68 @@
+# chance-of-files configuration (v0.2, phase 1: read-only tools).
+#
+# The server reads this file from --config, else $CHANCE_OF_FILES_CONFIG, else
+# /etc/chance-of-files/config.toml. Every key is optional; the values below are the defaults.
+# Unknown keys are logged and ignored.
+#
+# Secrets never go in this file. They come from the environment:
+#   INTERNAL_TOKEN  the bearer token the auth Worker sends on every /mcp request
+#   RC_PASS         the password of rclone's remote-control API (user [rclone].user)
+#
+# Paths are absolute paths on the drive ("/" is its root). Rules match ignoring case and
+# accents, so "/crypto folder" also covers "/Crypto Folder".
+
+[server]
+# Where the HTTP server listens. In the pod everything shares loopback; cloudflared forwards
+# the tunnel to this address.
+listen = "127.0.0.1:8080"
+# How long one tool call may take before it returns what it has (with a note saying so).
+# Cloudflare and Claude let a call run ~200 s; Claude gives up at 240 s. Units: ms, s, m, h.
+deadline = "180s"
+# Browser origins allowed in an Origin header, on top of https://claude.ai and
+# https://claude.com, which are always allowed. Requests without an Origin are always allowed.
+allowed_origins = []
+# A writable directory for state kept across restarts (unused in phase 1; created at startup
+# if set). In the pod: a directory on the chance-of-files-data volume.
+# state_dir = "/var/lib/chance-of-files/state"
+
+[rclone]
+# rclone rcd's remote-control address. Plain http on loopback only: the rc password can read
+# any file in the rclone container, so it never leaves the pod.
+url = "http://127.0.0.1:5572"
+# The rc user (rclone rcd --rc-user); the password is RC_PASS.
+user = "core"
+# The rclone remote that holds the drive, with or without the trailing colon.
+remote = "pcloud"
+
+[policy]
+# Folders (or files) that don't exist as far as clients can tell: never listed, searched,
+# read or written, and any path under them answers "not found".
+# hidden = ["/Crypto Folder"]
+hidden = []
+# Folders that stay visible and readable but are never changed (enforced by the write tools of
+# a later version; listed now so the rule is in place before writes exist).
+# protected = ["/Backups/Immich"]
+protected = []
+# Folders search_files doesn't go into (too big to search usefully). A search above one goes
+# around it without fetching it; list_folder still browses it.
+# search_skip = ["/Backups/Immich"]
+search_skip = []
+
+[guide]
+# A text file on the drive whose first 8 KiB go into the server's instructions, so the owner
+# can tell Claude what each folder is for. Missing or unreadable means no guide. "" turns it
+# off.
+path = "/AGENTS.md"
+
+[limits]
+# Most bytes read_text_file returns per call (Claude cuts tool results at ~150,000 chars).
+max_read_bytes = 100000
+# Largest image read_image returns (base64 adds a third).
+max_image_bytes = 1572864
+# Most bytes of one rclone answer the server takes in. A recursive listing of ~133,000 entries
+# is ~35 MB; a bigger answer fails with "too many entries" instead of using more memory.
+max_listing_bytes = 64000000
+# Most results search_files returns.
+search_limit = 50
+# Largest /mcp request body accepted.
+max_body_bytes = 1048576

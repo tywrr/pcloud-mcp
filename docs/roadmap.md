@@ -1,46 +1,28 @@
 # Roadmap
 
-Roughly in order. Nothing here has a date; the first item waits on pCloud.
+The phases of [design v2](design/v2.md#phased-delivery), in order. Nothing has a date; phase 5 waits on pCloud.
 
-## pCloud API backend, and a `pcloud-sdk` crate
+| Release | Ships | Done when |
+|---|---|---|
+| **0.1** | Two Workers + the laptop's pCloud Drive mount; five read tools. Frozen at tag [`v0.1.0`](https://github.com/tywrr/chance-of-files/tree/v0.1.0) | (shipped) |
+| **0.2: native parity** (in progress) | `crates/server`, `crates/rclone`; the same five tools on a native core in your own cluster; `files:read` / `files:write` scopes; auth Worker on a VPC service; kustomize base and `build-image.sh` | The old two-Worker stack is deleted and everything runs on the Workers free plan |
+| **0.3: index + audit** | `crates/index` (SQLite): a metadata index of the whole drive, walked every 30 min by splitting the tree around hidden paths and child roots; `folder_stats`, `query_files`, `find_duplicates`, `recent_changes`, `type_breakdown`, `index_status`, `refresh_index`; a backend health check | Claude answers "where did my 408 GiB go" in one or two calls |
+| **0.4: writes + links** | `create_folder`, `move`, `copy`, `write_file`, `delete` (to pCloud's trash only), all behind `files:write` and `policy.protected`, with Claude asking before each; async jobs for folders; expiring download links (single files with `Range`, streamed zips) and chunked upload links through the auth Worker | A 5 GB folder round-trips to Duet's computer and back |
+| **0.5: mirror + full text** | A one-way local mirror driven by the index; text extraction (PDF, DOCX/XLSX/PPTX, EML, MBOX); `read_document`, `search_content`; `read_image` downscaling | Claude finds a 2019 email by sender and phrase |
+| **pCloud API backend** | A `pcloud-sdk` crate and a `Storage` backend that calls pCloud directly: change feed (`diff`) instead of polling, server-side thumbnails (`getthumb`) | When pCloud approves this project's OAuth app |
 
-The big one: read pCloud directly from the Worker, so the laptop, the tunnel and rclone go away.
+The seams for these are already in 0.2: the `Storage` trait (a write trait joins it in 0.4), scopes on every tool, `Policy` with `protected`, the data volume at `/var/lib/chance-of-files`, and the auth Worker's single `CORE` fetch path.
 
-- **Waiting on**: pCloud approving an OAuth app for this project (requested; app registration is manual since password sign-in was removed in April 2026). See [background.md](background.md#pcloud-api-facts-and-gotchas).
-- **Shape**: a new crate implementing `Storage` (`list` → `listfolder`, `stat` → `stat`, `read` → `getfilelink` plus a ranged `GET` from the Worker itself, `search` → `search` or a bounded walk), chosen by config in the core Worker. The tools don't change.
-- **Auth**: the auth front grows a second leg: after the passphrase, it sends the owner through pCloud's OAuth once and stores the pCloud token (encrypted, in KV), with the client secret as a Worker secret. US and EU API hosts both supported.
-- **`pcloud-sdk` crate**: the pCloud client itself (auth, the methods above, typed errors, both API hosts), runtime-neutral like `chance-of-files-webdav` (generic over the HTTP transport), so it's useful outside this project. The name `pcloud-sdk` is free on crates.io as of 2026-10-29.
-- **Keep WebDAV**: the WebDAV backend stays for anyone who would rather serve a local folder, a NAS, or rclone's `pcloud:` remote.
+## Not planned
 
-## Write tools, behind a flag
-
-Off by default, and enabled per tool with a config var on the core (for example `WRITE_TOOLS=mkdir,move`), because a read-only connector is a much smaller risk.
-
-| Tool | Notes |
-|---|---|
-| `create_folder` | |
-| `move` / `rename` | Within the served folder only |
-| `upload_text_file` | Small text files from Claude; size-capped |
-| `trash` | Delete to pCloud's trash, never permanently (Duet already asks before deleting anything) |
-
-With the WebDAV backend these need rclone without `--read-only`, so they'll likely come with the API backend first. MCP tool annotations (`readOnlyHint`, `destructiveHint`) mark them so Claude asks before using them.
-
-## All-Rust OAuth option
-
-An optional OAuth server inside the Rust Worker, for people who want one Worker and one language: PKCE, CIMD (with SSRF-safe fetches), DCR, refresh rotation and hashed tokens in KV, tested against the same flows as the TypeScript front. The TypeScript front stays the default until this has had real use; see [background.md](background.md#alternatives-considered) for why it isn't first.
-
-## Fuller MCP 2026-07-28 support
-
-Today the endpoint is stateless and answers `initialize` for 2025-03-26, 2025-06-18 and 2025-11-25, with the cheap parts of 2026-07-28's stateless requests. Next: the rest of 2026-07-28 as Claude adopts it, `outputSchema` and structured content for the listing tools, and resource links so Claude can refer back to files.
-
-## More file types
-
-- **PDF text extraction** in `read_text_file` (or a `read_document` tool), within the 10 ms CPU budget or behind a size cap; scanned PDFs need OCR and are out of scope for the Worker.
-- **Office documents**: text from `.docx`, `.xlsx` and `.pptx` (zipped XML, so feasible in Rust on wasm).
-- **Thumbnails**: `read_image` returns a downscaled image when the original is over `MAX_IMAGE_BYTES`, instead of an error. pCloud's API can make thumbnails server-side (`getthumb`), which the API backend should use.
+- Permanent deletes, emptying the trash, pCloud Rewind.
+- Two-way sync.
+- Photo contents, OCR, embeddings.
+- Public sharing links.
+- Workers Paid, or a Workers-only core (0.1 stays tagged for that).
 
 ## Smaller things
 
-- Content search, if the pCloud API or an index makes it cheap; today `search_files` matches names only.
-- Better errors when the laptop is asleep ("the backend is offline" rather than a timeout).
-- Tunnel setup through the Cloudflare API instead of the dashboard, for scripting.
+- Published multi-arch images on ghcr.io, built by CI on tags (until then, `deploy/build-image.sh`).
+- Fuller MCP 2026-07-28 support as Claude adopts it: `outputSchema` and structured content for the listing tools, resource links.
+- If Workers VPC stops being free: a tunnel public hostname behind a Cloudflare Access service token, as a config switch in the auth Worker ([design, Risks](design/v2.md#risks)).

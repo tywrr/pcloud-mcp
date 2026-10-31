@@ -5,10 +5,11 @@
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --local",
+    "dev:tunnel": "wrangler dev -c wrangler.personal.jsonc",
     "test": "vitest run",
     "typecheck": "wrangler types --strict-vars=false --check && tsc --noEmit",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy -c wrangler.personal.jsonc",
     "cf-typegen": "wrangler types --strict-vars=false"
   },
   "dependencies": {

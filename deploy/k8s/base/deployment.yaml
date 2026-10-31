@@ -1,0 +1,125 @@
+# One pod, three containers sharing loopback (docs/architecture.md):
+#   core         the chance-of-files server on 127.0.0.1:8080, the address the Workers VPC service
+#                points at; MCP on POST /mcp, /healthz, /readyz
+#   rclone       rclone rcd on 127.0.0.1:5572, the core's only way to pCloud
+#   cloudflared  the tunnel's connector, dialling out over QUIC
+#
+# Secret chance-of-files (created by deploy/k8s/apply.sh, never in git):
+#   internal-token   the auth Worker's INTERNAL_TOKEN; the core refuses /mcp without it
+#   rc-pass          rclone's rc password. It is root-equivalent inside the rclone container
+#                    (--rc-serve also serves local paths), so it never leaves the pod
+#   pcloud-token, pcloud-hostname   from an authorised rclone pcloud remote (`rclone config dump`)
+#   tunnel-token     the tunnel's eyJ... token
+#
+# One replica with Recreate: Cloudflare spreads requests over every connector of a tunnel, so two
+# pods (or a rolling update) would split traffic between an old and a new core.
+#
+# No probes. The kubelet sends httpGet probes to the pod IP, and nothing here listens on it: the
+# core binds 127.0.0.1 only, so that the tunnel is the one way in. Exec probes would need a shell
+# or an HTTP client in images that have neither. Readiness gates nothing either, since no Service
+# selects this pod and cloudflared connects whether or not the core is ready. Instead, apply.sh
+# checks GET /readyz through `kubectl port-forward` (which connects on the pod's loopback) after
+# each rollout, and a crashed container is restarted by its exit like any other.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chance-of-files
+  labels: { app.kubernetes.io/name: chance-of-files }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: chance-of-files }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: chance-of-files }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: core
+          image: ghcr.io/tywrr/chance-of-files
+          # An image imported with `k3s ctr images import` (deploy/build-image.sh) exists only on the node.
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: CHANCE_OF_FILES_CONFIG, value: /etc/chance-of-files/config.toml }
+            - name: INTERNAL_TOKEN
+              valueFrom: { secretKeyRef: { name: chance-of-files, key: internal-token } }
+            - name: RC_PASS
+              valueFrom: { secretKeyRef: { name: chance-of-files, key: rc-pass } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/chance-of-files, readOnly: true }
+            - { name: data, mountPath: /var/lib/chance-of-files }
+            - { name: core-tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+        - name: rclone
+          image: rclone/rclone:1.75.2
+          # No --filter-from and no other filter, ever: a directory filter turns off pCloud's
+          # recursive listing and server-side folder moves, and filters don't stop single-object
+          # calls anyway. The core's policy is what hides paths (docs/design/phase0-rclone.md).
+          args:
+            - rcd
+            - --rc-addr=127.0.0.1:5572
+            - --rc-serve
+            - --tpslimit=8
+          env:
+            # rclone reads any flag from RCLONE_<FLAG>, so the password stays out of the args (and ps).
+            - { name: RCLONE_RC_USER, value: core }
+            - name: RCLONE_RC_PASS
+              valueFrom: { secretKeyRef: { name: chance-of-files, key: rc-pass } }
+            # The remote "pcloud" is defined entirely by env vars; no rclone.conf is read or written.
+            - { name: RCLONE_CONFIG, value: /tmp/rclone.conf }
+            - { name: RCLONE_CACHE_DIR, value: /tmp/cache }
+            - { name: RCLONE_CONFIG_PCLOUD_TYPE, value: pcloud }
+            - name: RCLONE_CONFIG_PCLOUD_HOSTNAME
+              valueFrom: { secretKeyRef: { name: chance-of-files, key: pcloud-hostname } }
+            - name: RCLONE_CONFIG_PCLOUD_TOKEN
+              valueFrom: { secretKeyRef: { name: chance-of-files, key: pcloud-token } }
+          volumeMounts:
+            - { name: rclone-tmp, mountPath: /tmp }
+          resources:
+            # Measured peaks: idle 84 MB, a recursive listing of 133k entries ~440 MB. Walks
+            # (from 0.3) run one at a time, so 1 Gi leaves about 2x headroom.
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: "2", memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.10.2
+          # --protocol quic: Workers VPC doesn't work over http2, which "auto" can fall back to.
+          # --metrics on loopback: in a container cloudflared would otherwise bind it on 0.0.0.0.
+          args: [tunnel, --no-autoupdate, --protocol, quic, --metrics, 127.0.0.1:20241, run]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom: { secretKeyRef: { name: chance-of-files, key: tunnel-token } }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+      volumes:
+        - name: config
+          configMap: { name: chance-of-files-config }
+        - name: data
+          persistentVolumeClaim: { claimName: chance-of-files-data }
+        - name: core-tmp
+          emptyDir: { sizeLimit: 64Mi }
+        - name: rclone-tmp
+          emptyDir: { sizeLimit: 256Mi }

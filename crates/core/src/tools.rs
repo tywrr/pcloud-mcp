@@ -1,20 +1,27 @@
-//! The five read-only tools: definitions for `tools/list` and their implementations over a
-//! [`Storage`].
+//! The read tools: definitions for `tools/list` and their implementations over a [`Storage`].
 //!
 //! Problems the model can fix (a wrong path, a missing argument, a file that is too big) come
 //! back as tool results with `isError: true`, as MCP 2025-11-25 recommends, so the model sees
 //! the message and can retry. Only an unknown tool name is a protocol error.
+//!
+//! Every path from a client goes through [`Policy::check`] before any storage call, and every
+//! entry a backend returns goes through [`Policy::visible`] before it is shown.
 
 use std::fmt::Write as _;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotations, object};
 use serde_json::{Map, Value, json};
+use tokio::time::Instant;
 
-use crate::matching::{NameMatcher, fold};
+use crate::matching::NameMatcher;
+use crate::policy::{CheckedPath, PathSet, Policy};
+use crate::scope::{Scope, Scopes};
 use crate::server::ServerConfig;
-use crate::storage::{ByteRange, Entry, Storage, StorageError, normalize_path};
+use crate::storage::{ByteRange, Entry, Storage, StorageError, read_capped};
 
 const LIST_FOLDER: &str = "list_folder";
 const GET_FILE_INFO: &str = "get_file_info";
@@ -22,16 +29,23 @@ const READ_TEXT_FILE: &str = "read_text_file";
 const READ_IMAGE: &str = "read_image";
 const SEARCH_FILES: &str = "search_files";
 
-/// Most entries `list_folder` shows.
+/// Every tool and the scope it needs, in `tools/list` order (2026-07-28 asks for a
+/// deterministic list so clients can cache it).
+const TOOLS: &[(&str, Scope)] = &[
+    (LIST_FOLDER, Scope::Read),
+    (GET_FILE_INFO, Scope::Read),
+    (READ_TEXT_FILE, Scope::Read),
+    (READ_IMAGE, Scope::Read),
+    (SEARCH_FILES, Scope::Read),
+];
+
+/// Most entries one `list_folder` page shows.
 const MAX_LIST_ENTRIES: usize = 1000;
 /// Most characters of entry lines in one result. Claude truncates tool results at about
 /// 150,000 characters; a folder of long paths could pass that before 1000 entries.
 const MAX_LISTING_CHARS: usize = 120_000;
 /// How much of a file is checked for NUL bytes before it is treated as binary (git does the same).
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
-/// Most storage calls a search split around turned-off folders makes. Each is a request to
-/// the WebDAV backend, and the Workers free plan allows 50 subrequests per request.
-const MAX_SPLIT_CALLS: usize = 40;
 
 const PNG: &str = "image/png";
 const JPEG: &str = "image/jpeg";
@@ -41,18 +55,83 @@ const WEBP: &str = "image/webp";
 /// What a tool returns: its output, or a message for the model.
 type ToolOutput = Result<Vec<ContentBlock>, String>;
 
-/// Tool definitions in a fixed order (2026-07-28 asks for a deterministic list so clients
-/// can cache it). Limits in the descriptions and schemas come from `config`.
-pub(crate) fn definitions(config: &ServerConfig) -> Vec<Tool> {
+/// The outcome of `tools/call`.
+pub(crate) enum Called {
+    Done(CallToolResult),
+    Unknown,
+}
+
+/// Everything a tool call needs, and when it has to be done by.
+pub(crate) struct Ctx<'a, S> {
+    storage: &'a S,
+    config: &'a ServerConfig,
+    policy: &'a Policy,
+    deadline: Instant,
+}
+
+/// A storage call that didn't finish before the call's deadline.
+struct Late;
+
+impl<'a, S: Storage> Ctx<'a, S> {
+    pub(crate) fn new(storage: &'a S, config: &'a ServerConfig, policy: &'a Policy) -> Self {
+        Self {
+            storage,
+            config,
+            policy,
+            deadline: Instant::now() + config.deadline,
+        }
+    }
+
+    /// `work`, unless the deadline passes first.
+    async fn within<T>(&self, work: impl Future<Output = T>) -> Result<T, Late> {
+        tokio::time::timeout_at(self.deadline, work)
+            .await
+            .map_err(|_| Late)
+    }
+
+    /// `work` for a tool that can't return a partial answer: past the deadline it fails.
+    async fn timed<T>(
+        &self,
+        work: impl Future<Output = Result<T, StorageError>>,
+    ) -> Result<T, String> {
+        match self.within(work).await {
+            Ok(result) => result.map_err(storage_error),
+            Err(Late) => Err(format!(
+                "The storage backend didn't answer within the {} time limit. Try again later.",
+                seconds(self.config.deadline)
+            )),
+        }
+    }
+
+    fn check(&self, path: &str) -> Result<CheckedPath, String> {
+        self.policy.check(path).map_err(storage_error)
+    }
+}
+
+/// Tool definitions the client's scopes allow, in a fixed order. Limits in the descriptions
+/// and schemas come from `config`.
+pub(crate) fn definitions(config: &ServerConfig, scopes: Scopes) -> Vec<Tool> {
+    TOOLS
+        .iter()
+        .filter(|(_, scope)| scopes.contains(*scope))
+        .map(|(name, _)| definition(config, name))
+        .collect()
+}
+
+fn definition(config: &ServerConfig, name: &str) -> Tool {
     let max_read = config.max_read_bytes.max(1);
     let search_limit = config.search_limit.max(1);
-    vec![
-        tool(
+    match name {
+        LIST_FOLDER => tool(
             LIST_FOLDER,
             "List folder",
-            "List the files and folders directly inside a folder of the shared pCloud folder. \
-             Folders come first, then files, each sorted by name, with type, size, last-modified \
-             time and full path. Paths are relative to the shared folder's root \"/\".",
+            &format!(
+                "List the files and folders directly inside a folder of the pCloud drive. Folders \
+                 come first, then files, each sorted by name, with type, size, last-modified time \
+                 and full path. Paths start at the drive's root \"/\". Shows up to \
+                 {MAX_LIST_ENTRIES} entries per call; a longer folder ends with a cursor to pass \
+                 back for the next page."
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -60,12 +139,16 @@ pub(crate) fn definitions(config: &ServerConfig) -> Vec<Tool> {
                         "type": "string",
                         "description": "Folder to list, e.g. \"/\" or \"/Notes/2026\".",
                         "default": "/"
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "From the previous page of the same folder, to continue it."
                     }
                 },
                 "additionalProperties": false
             }),
         ),
-        tool(
+        GET_FILE_INFO => tool(
             GET_FILE_INFO,
             "Get file info",
             "Get the details of one file or folder: type, exact size in bytes, last-modified \
@@ -82,7 +165,7 @@ pub(crate) fn definitions(config: &ServerConfig) -> Vec<Tool> {
                 "additionalProperties": false
             }),
         ),
-        tool(
+        READ_TEXT_FILE => tool(
             READ_TEXT_FILE,
             "Read text file",
             &format!(
@@ -117,7 +200,7 @@ pub(crate) fn definitions(config: &ServerConfig) -> Vec<Tool> {
                 "additionalProperties": false
             }),
         ),
-        tool(
+        READ_IMAGE => tool(
             READ_IMAGE,
             "Read image",
             &format!(
@@ -137,7 +220,7 @@ pub(crate) fn definitions(config: &ServerConfig) -> Vec<Tool> {
                 "additionalProperties": false
             }),
         ),
-        tool(
+        SEARCH_FILES => tool(
             SEARCH_FILES,
             "Search files",
             &format!(
@@ -171,13 +254,14 @@ pub(crate) fn definitions(config: &ServerConfig) -> Vec<Tool> {
                 "additionalProperties": false
             }),
         ),
-    ]
+        _ => unreachable!("every name in TOOLS has a definition"),
+    }
 }
 
 fn tool(name: &'static str, title: &str, description: &str, schema: Value) -> Tool {
     let schema: Arc<JsonObject> = Arc::new(object(schema));
-    // Every tool only reads, and only from the one shared folder. The title is repeated in the
-    // annotations for 2025-03-26 clients, which predate Tool.title.
+    // Every tool so far only reads. The title is repeated in the annotations for 2025-03-26
+    // clients, which predate Tool.title.
     let annotations = ToolAnnotations::with_title(title)
         .read_only(true)
         .destructive(false)
@@ -188,36 +272,62 @@ fn tool(name: &'static str, title: &str, description: &str, schema: Value) -> To
         .with_annotations(annotations)
 }
 
-/// Runs a tool. `None` means there is no tool by that name.
+/// Runs a tool, if the client's scopes allow it.
 pub(crate) async fn call<S: Storage>(
-    storage: &S,
-    config: &ServerConfig,
+    ctx: &Ctx<'_, S>,
     name: &str,
     args: &Map<String, Value>,
-) -> Option<CallToolResult> {
+    scopes: Scopes,
+) -> Called {
+    let Some(&(_, scope)) = TOOLS.iter().find(|(tool, _)| *tool == name) else {
+        return Called::Unknown;
+    };
+    if !scopes.contains(scope) {
+        return Called::Done(CallToolResult::error(vec![ContentBlock::text(format!(
+            "{name} needs the {scope} permission, which this connection wasn't granted. The \
+             owner can grant it by reconnecting the connector."
+        ))]));
+    }
     let args = Args(args);
     let output = match name {
-        LIST_FOLDER => list_folder(storage, &args).await,
-        GET_FILE_INFO => get_file_info(storage, &args).await,
-        READ_TEXT_FILE => read_text_file(storage, config, &args).await,
-        READ_IMAGE => read_image(storage, config, &args).await,
-        SEARCH_FILES => search_files(storage, config, &args).await,
-        _ => return None,
+        LIST_FOLDER => list_folder(ctx, &args).await,
+        GET_FILE_INFO => get_file_info(ctx, &args).await,
+        READ_TEXT_FILE => read_text_file(ctx, &args).await,
+        READ_IMAGE => read_image(ctx, &args).await,
+        SEARCH_FILES => search_files(ctx, &args).await,
+        _ => return Called::Unknown,
     };
-    Some(match output {
+    Called::Done(match output {
         Ok(content) => CallToolResult::success(content),
         Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
     })
 }
 
-async fn list_folder<S: Storage>(storage: &S, args: &Args<'_>) -> ToolOutput {
-    let path = args.path("path")?.unwrap_or_else(|| "/".into());
-    let mut entries = storage.list(&path).await.map_err(storage_error)?;
+/// Folders first, then files, each by name ignoring case.
+fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase(), e.name.clone()));
+}
+
+async fn list_folder<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
+    let path = ctx.check(args.string("path")?.unwrap_or("/"))?;
+    let offset = match args.string("cursor")? {
+        None | Some("") => 0,
+        Some(cursor) => decode_cursor(cursor).ok_or(
+            "cursor is not one list_folder gave out; leave it out to start from the first page.",
+        )?,
+    };
+    let mut entries = ctx.timed(ctx.storage.list(&path)).await?;
+    entries.retain(|e| ctx.policy.visible(&e.path));
+    sort_entries(&mut entries);
 
     let total = entries.len();
     if total == 0 {
         return Ok(vec![ContentBlock::text(format!("Folder {path} is empty."))]);
+    }
+    if offset >= total {
+        return Err(format!(
+            "The cursor is past the end of {path}, which has {total} entries now."
+        ));
     }
     let folders = entries.iter().filter(|e| e.is_dir).count();
     let mut text = format!(
@@ -225,18 +335,48 @@ async fn list_folder<S: Storage>(storage: &S, args: &Args<'_>) -> ToolOutput {
         count(folders, "folder", "folders"),
         count(total - folders, "file", "files")
     );
-    let shown = push_entry_lines(&mut text, entries.iter().take(MAX_LIST_ENTRIES));
-    if shown < total {
-        text.push_str(&format!(
-            "Showing the first {shown} of {total} entries. Use search_files to find a specific name.\n"
-        ));
+    let shown = push_entry_lines(
+        &mut text,
+        entries.iter().skip(offset).take(MAX_LIST_ENTRIES),
+    );
+    let end = offset + shown;
+    if end < total {
+        let range = if offset == 0 {
+            format!("the first {shown}")
+        } else {
+            format!("entries {}-{end}", offset + 1)
+        };
+        let _ = writeln!(
+            text,
+            "Showing {range} of {total} entries. For the next page call list_folder again with \
+             cursor=\"{}\", or use search_files to find a specific name.",
+            encode_cursor(end)
+        );
+    } else if offset > 0 {
+        let _ = writeln!(text, "Showing entries {}-{end} of {total}.", offset + 1);
     }
     Ok(vec![ContentBlock::text(text)])
 }
 
-async fn get_file_info<S: Storage>(storage: &S, args: &Args<'_>) -> ToolOutput {
-    let path = args.required_path("path")?;
-    let entry = storage.stat(&path).await.map_err(storage_error)?;
+/// Cursors are opaque to the model, so the format can change; today it's the next offset.
+fn encode_cursor(offset: usize) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("o:{offset}"))
+}
+
+fn decode_cursor(cursor: &str) -> Option<usize> {
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.trim())
+        .ok()?;
+    std::str::from_utf8(&raw)
+        .ok()?
+        .strip_prefix("o:")?
+        .parse()
+        .ok()
+}
+
+async fn get_file_info<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
+    let path = ctx.check(args.required_path("path")?)?;
+    let entry = ctx.timed(ctx.storage.stat(&path, false)).await?;
     let mut text = format!("Path: {}\n", entry.path);
     if !entry.name.is_empty() {
         text.push_str(&format!("Name: {}\n", entry.name));
@@ -262,21 +402,17 @@ async fn get_file_info<S: Storage>(storage: &S, args: &Args<'_>) -> ToolOutput {
     Ok(vec![ContentBlock::text(text)])
 }
 
-async fn read_text_file<S: Storage>(
-    storage: &S,
-    config: &ServerConfig,
-    args: &Args<'_>,
-) -> ToolOutput {
-    let path = args.required_path("path")?;
+async fn read_text_file<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
+    let path = ctx.check(args.required_path("path")?)?;
     let offset = args.uint("offset")?.unwrap_or(0);
-    let max_read = config.max_read_bytes.max(1);
+    let max_read = ctx.config.max_read_bytes.max(1);
     let limit = match args.uint("max_bytes")? {
         Some(0) => return Err("max_bytes must be at least 1.".into()),
         Some(n) => n.min(max_read),
         None => max_read,
     };
 
-    let entry = storage.stat(&path).await.map_err(storage_error)?;
+    let entry = ctx.timed(ctx.storage.stat(&path, false)).await?;
     if entry.is_dir {
         return Err(format!(
             "{path} is a folder, not a file. Use list_folder to see what it contains."
@@ -297,17 +433,16 @@ async fn read_text_file<S: Storage>(
         _ => {}
     }
 
-    let mut bytes = storage
-        .read(
-            &path,
-            ByteRange {
-                offset,
-                length: limit,
-            },
-        )
-        .await
-        .map_err(storage_error)?;
-    bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let range = ByteRange {
+        offset,
+        length: limit,
+    };
+    let bytes = ctx
+        .timed(async {
+            let stream = ctx.storage.open(&path, Some(range)).await?;
+            read_capped(stream, limit).await
+        })
+        .await?;
     if bytes.is_empty() {
         return if offset == 0 {
             Ok(vec![ContentBlock::text(format!("({path} is empty.)"))])
@@ -362,9 +497,9 @@ async fn read_text_file<S: Storage>(
     ))])
 }
 
-async fn read_image<S: Storage>(storage: &S, config: &ServerConfig, args: &Args<'_>) -> ToolOutput {
-    let path = args.required_path("path")?;
-    let entry = storage.stat(&path).await.map_err(storage_error)?;
+async fn read_image<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
+    let path = ctx.check(args.required_path("path")?)?;
+    let entry = ctx.timed(ctx.storage.stat(&path, false)).await?;
     if entry.is_dir {
         return Err(format!(
             "{path} is a folder, not a file. Use list_folder to see what it contains."
@@ -376,7 +511,7 @@ async fn read_image<S: Storage>(storage: &S, config: &ServerConfig, args: &Args<
              get_file_info for its details."
         ));
     };
-    let max = config.max_image_bytes;
+    let max = ctx.config.max_image_bytes;
     let too_large = |size: u64| {
         format!(
             "{path} is {}, larger than the {} read_image can return.",
@@ -389,12 +524,17 @@ async fn read_image<S: Storage>(storage: &S, config: &ServerConfig, args: &Args<
     {
         return Err(too_large(size));
     }
-    // Without a known size, ask for one byte more than allowed to tell "fits" from "too big".
-    let length = entry.size.unwrap_or(max.saturating_add(1));
-    let bytes = storage
-        .read(&path, ByteRange { offset: 0, length })
-        .await
-        .map_err(storage_error)?;
+    // One byte more than allowed, to tell "fits" from "too big" when the size was wrong.
+    let length = max.saturating_add(1);
+    let bytes = ctx
+        .timed(async {
+            let stream = ctx
+                .storage
+                .open(&path, Some(ByteRange { offset: 0, length }))
+                .await?;
+            read_capped(stream, length).await
+        })
+        .await?;
     if bytes.len() as u64 > max {
         return Err(too_large(bytes.len() as u64));
     }
@@ -419,50 +559,36 @@ async fn read_image<S: Storage>(storage: &S, config: &ServerConfig, args: &Args<
     ])
 }
 
-async fn search_files<S: Storage>(
-    storage: &S,
-    config: &ServerConfig,
-    args: &Args<'_>,
-) -> ToolOutput {
+async fn search_files<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
     let query = args
         .string("query")?
         .map(str::trim)
         .filter(|q| !q.is_empty())
         .ok_or("query is required: part of a file or folder name to look for.")?;
-    let root = args.path("path")?.unwrap_or_else(|| "/".into());
-    let max = config.search_limit.max(1);
+    let root = ctx.check(args.string("path")?.unwrap_or("/"))?;
+    let max = ctx.config.search_limit.max(1);
     let limit = match args.uint("limit")? {
         Some(0) => return Err("limit must be at least 1.".into()),
         Some(n) => usize::try_from(n).unwrap_or(usize::MAX).min(max),
         None => max,
     };
 
-    // Compared folded, like names in search: an entry matches the folder whatever its case
-    // or accents, so "/backups/immich" turns off "/Backups/Immich" as list_folder shows it.
-    let skip: Vec<String> = config.search_skip.iter().map(|f| fold(f)).collect();
-    let folded_root = fold(&root);
-    if let Some(i) = skip
-        .iter()
-        .position(|folder| is_at_or_under(&folded_root, folder))
-    {
-        let off = &config.search_skip[i];
+    // Compared folded, like names in search: "/backups/immich" turns off "/Backups/Immich"
+    // as list_folder shows it.
+    if let Some(off) = ctx.policy.search_skip().covering(root.as_str()) {
         return Err(format!(
             "Search is turned off under {off} because it's too large. Browse it with list_folder \
              instead."
         ));
     }
-    let (found, notes) = if skip.iter().any(|folder| is_under(folder, &folded_root)) {
-        let mut split = SplitSearch::new(storage, query, &skip, limit);
-        split.folder(&root).await.map_err(storage_error)?;
-        split.finish(&root)?
+    let excludes = ctx.policy.search_excludes();
+    let mut search = Search::new(ctx, query, &excludes, limit);
+    if excludes.any_below(root.as_str()) {
+        search.folder(&root).await.map_err(storage_error)?;
     } else {
-        let mut found = storage
-            .search(&root, query, limit)
-            .await
-            .map_err(storage_error)?;
-        found.truncate(limit);
-        (found, Vec::new())
-    };
+        search.subtree(&root).await?;
+    }
+    let (found, more, notes) = search.finish(&root)?;
 
     let mut text = if found.is_empty() {
         let partly = if notes.is_empty() {
@@ -478,7 +604,7 @@ async fn search_files<S: Storage>(
         )
     };
     let shown = push_entry_lines(&mut text, found.iter());
-    if found.len() == limit || shown < found.len() {
+    if more || shown < found.len() {
         text.push_str(&format!(
             "Showing the first {shown} matches; there may be more. Narrow the query or the path.\n"
         ));
@@ -492,23 +618,24 @@ async fn search_files<S: Storage>(
     Ok(vec![ContentBlock::text(text)])
 }
 
-/// A search that goes around turned-off folders: it lists every folder with one somewhere
-/// inside (matching the names itself), and searches each other subfolder whole. A subfolder
-/// that fails doesn't sink the rest; the result says which ones were left out.
-struct SplitSearch<'a, S> {
-    storage: &'a S,
-    query: &'a str,
+/// A name search. Where nothing below a folder is excluded it walks the folder whole; above
+/// an excluded folder (hidden, or turned off for search) it lists one level at a time, so
+/// excluded folders are never fetched (see [`crate::split_walk`]). A subfolder that fails
+/// doesn't sink the rest, and the deadline ends the search with what it has; the result says
+/// what was left out.
+struct Search<'a, 'c, S> {
+    ctx: &'c Ctx<'a, S>,
     matcher: NameMatcher,
-    /// The turned-off folders, folded (see [`fold`]).
-    skip: &'a [String],
+    excludes: &'c PathSet,
     limit: usize,
-    calls: usize,
     found: Vec<Entry>,
-    /// Subfolder searches that worked.
+    /// More matched than `limit` allowed, or the search stopped at `limit`.
+    more: bool,
+    /// Subtrees walked whole without failing.
     searched: usize,
     /// Turned-off folders passed on the way.
     skipped: Vec<String>,
-    /// Subfolders with too many entries to search in this call.
+    /// Subfolders with too many entries to take in at once.
     too_large: Vec<String>,
     /// Other subfolders that failed, each with the reason.
     failed: Vec<String>,
@@ -516,16 +643,15 @@ struct SplitSearch<'a, S> {
     stopped: Option<String>,
 }
 
-impl<'a, S: Storage> SplitSearch<'a, S> {
-    fn new(storage: &'a S, query: &'a str, skip: &'a [String], limit: usize) -> Self {
+impl<'a, 'c, S: Storage> Search<'a, 'c, S> {
+    fn new(ctx: &'c Ctx<'a, S>, query: &str, excludes: &'c PathSet, limit: usize) -> Self {
         Self {
-            storage,
-            query,
+            ctx,
             matcher: NameMatcher::new(query),
-            skip,
+            excludes,
             limit,
-            calls: 0,
             found: Vec::new(),
+            more: false,
             searched: 0,
             skipped: Vec::new(),
             too_large: Vec::new(),
@@ -534,61 +660,116 @@ impl<'a, S: Storage> SplitSearch<'a, S> {
         }
     }
 
-    /// Goes through the children of `dir`, which has a turned-off folder inside. Fails only
-    /// when `dir` itself can't be listed.
-    async fn folder(&mut self, dir: &str) -> Result<(), StorageError> {
-        self.calls += 1;
-        let mut children = self.storage.list(dir).await?;
-        children.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase(), e.name.clone()));
-        for child in children {
-            if self.found.len() >= self.limit || self.stopped.is_some() {
-                break;
-            }
-            let (path, is_dir) = (child.path.clone(), child.is_dir);
-            if self.matcher.matches(&child.name) {
-                self.found.push(child);
-                if self.found.len() >= self.limit {
-                    break;
-                }
-            }
-            if !is_dir {
-                continue;
-            }
-            let folded = fold(&path);
-            if self.skip.contains(&folded) {
-                self.skipped.push(path);
-                continue;
-            }
-            if self.calls >= MAX_SPLIT_CALLS {
-                self.stopped = Some(format!("it reached its limit of {MAX_SPLIT_CALLS} folders"));
-                break;
-            }
-            let result = if self.skip.iter().any(|folder| is_under(folder, &folded)) {
-                Box::pin(self.folder(&path)).await
-            } else {
-                self.search(&path).await
-            };
-            if let Err(err) = result {
-                self.left_out(path, err);
-            }
+    fn done(&self) -> bool {
+        self.found.len() >= self.limit || self.stopped.is_some()
+    }
+
+    fn late(&mut self) {
+        self.stopped = Some(format!(
+            "it reached the {} time limit",
+            seconds(self.ctx.config.deadline)
+        ));
+    }
+
+    /// Walks the search root whole. Its failure is the search's failure.
+    async fn subtree(&mut self, dir: &CheckedPath) -> Result<(), String> {
+        let ctx = self.ctx;
+        match ctx.within(ctx.storage.walk(dir, &[])).await {
+            Ok(Ok(entries)) => self.take_hits(entries),
+            Ok(Err(err)) => return Err(storage_error(err)),
+            Err(Late) => self.late(),
         }
         Ok(())
     }
 
-    async fn search(&mut self, dir: &str) -> Result<(), StorageError> {
-        self.calls += 1;
-        let room = self.limit - self.found.len();
-        let hits = self.storage.search(dir, self.query, room).await?;
+    /// Walks a subfolder whole; a failure becomes a note.
+    async fn subtree_or_note(&mut self, dir: &CheckedPath) {
+        let ctx = self.ctx;
+        match ctx.within(ctx.storage.walk(dir, &[])).await {
+            Ok(Ok(entries)) => self.take_hits(entries),
+            Ok(Err(err)) => self.left_out(dir.as_str().to_owned(), err),
+            Err(Late) => self.late(),
+        }
+    }
+
+    /// Keeps the matching, visible entries of one walked subtree, in path order.
+    fn take_hits(&mut self, entries: Vec<Entry>) {
         self.searched += 1;
+        let policy = self.ctx.policy;
+        let mut hits: Vec<Entry> = entries
+            .into_iter()
+            .filter(|e| policy.visible(&e.path) && self.matcher.matches(&e.name))
+            .collect();
+        hits.sort_by_cached_key(|e| (e.path.to_lowercase(), e.path.clone()));
+        let room = self.limit - self.found.len();
+        if hits.len() > room {
+            self.more = true;
+        }
         self.found.extend(hits.into_iter().take(room));
-        Ok(())
+    }
+
+    /// Goes through the children of `dir`, which has an excluded folder inside. Fails only
+    /// when `dir` itself can't be listed.
+    fn folder<'f>(
+        &'f mut self,
+        dir: &'f CheckedPath,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'f>>
+    where
+        'a: 'f,
+        'c: 'f,
+    {
+        Box::pin(async move {
+            let ctx = self.ctx;
+            let mut children = match ctx.within(ctx.storage.list(dir)).await {
+                Ok(children) => children?,
+                Err(Late) => {
+                    self.late();
+                    return Ok(());
+                }
+            };
+            children.retain(|e| ctx.policy.visible(&e.path));
+            sort_entries(&mut children);
+            for child in children {
+                if self.done() {
+                    if self.found.len() >= self.limit {
+                        self.more = true;
+                    }
+                    break;
+                }
+                let (name, is_dir) = (child.name.clone(), child.is_dir);
+                if self.matcher.matches(&child.name) {
+                    self.found.push(child);
+                }
+                if !is_dir {
+                    continue;
+                }
+                let path = dir.child(&name);
+                if self.excludes.covers(path.as_str()) {
+                    // Hidden folders were dropped above, so this one is turned off for search.
+                    self.skipped.push(path.as_str().to_owned());
+                    continue;
+                }
+                if self.done() {
+                    self.more = true;
+                    break;
+                }
+                if self.excludes.any_below(path.as_str()) {
+                    if let Err(err) = self.folder(&path).await {
+                        self.left_out(path.as_str().to_owned(), err);
+                    }
+                } else {
+                    self.subtree_or_note(&path).await;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn left_out(&mut self, path: String, err: StorageError) {
         match err {
             StorageError::TooManyEntries(_) => self.too_large.push(path),
             err => {
-                if matches!(err, StorageError::Backend(_)) {
+                if matches!(err, StorageError::Backend(_) | StorageError::Unhealthy(_)) {
                     // Most likely down for every other folder too.
                     self.stopped = Some("the file server stopped answering".into());
                 }
@@ -598,9 +779,10 @@ impl<'a, S: Storage> SplitSearch<'a, S> {
         }
     }
 
-    /// The matches and notes on what was left out, or an error when no subfolder could be
-    /// searched and nothing matched.
-    fn finish(self, root: &str) -> Result<(Vec<Entry>, Vec<String>), String> {
+    /// The matches, whether there may be more, and notes on what was left out; or an error
+    /// when nothing could be searched and nothing matched.
+    #[allow(clippy::type_complexity)]
+    fn finish(self, root: &CheckedPath) -> Result<(Vec<Entry>, bool, Vec<String>), String> {
         let mut notes = Vec::new();
         if !self.too_large.is_empty() {
             notes.push(format!(
@@ -625,11 +807,12 @@ impl<'a, S: Storage> SplitSearch<'a, S> {
         }
         if let Some(why) = &self.stopped {
             notes.push(format!(
-                "The search stopped early because {why}; there may be more matches."
+                "The search stopped early because {why}; there may be more matches. Search a \
+                 narrower path to go through the rest."
             ));
         }
-        let failed_everywhere =
-            self.searched == 0 && !(self.too_large.is_empty() && self.failed.is_empty());
+        let failed_everywhere = self.searched == 0
+            && !(self.too_large.is_empty() && self.failed.is_empty() && self.stopped.is_none());
         if failed_everywhere && self.found.is_empty() {
             return Err(format!(
                 "Nothing under {root} could be searched.\n{}",
@@ -637,21 +820,8 @@ impl<'a, S: Storage> SplitSearch<'a, S> {
             ));
         }
         let notes = notes.into_iter().map(|note| note + "\n").collect();
-        Ok((self.found, notes))
+        Ok((self.found, self.more, notes))
     }
-}
-
-/// True when `path` is `folder` or anywhere inside it (both normalized).
-fn is_at_or_under(path: &str, folder: &str) -> bool {
-    folder == "/"
-        || path
-            .strip_prefix(folder)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
-/// True when `path` is inside `folder`, at any depth, but not `folder` itself.
-fn is_under(path: &str, folder: &str) -> bool {
-    path != folder && is_at_or_under(path, folder)
 }
 
 /// Appends one line per entry while the listing stays under [`MAX_LISTING_CHARS`]; returns
@@ -720,35 +890,30 @@ impl Args<'_> {
         }
     }
 
-    /// A normalized path, if the argument is present.
-    fn path(&self, key: &str) -> Result<Option<String>, String> {
+    fn required_path(&self, key: &str) -> Result<&str, String> {
         self.string(key)?
-            .map(|p| normalize_path(p).map_err(storage_error))
-            .transpose()
-    }
-
-    fn required_path(&self, key: &str) -> Result<String, String> {
-        self.path(key)?
             .ok_or_else(|| format!("{key} is required, e.g. \"/Notes/todo.md\"."))
     }
 }
 
 /// The error text for the model, with a hint at what to do next. Backend messages are
-/// scrubbed of URLs, which could name the tunnel or carry credentials.
+/// scrubbed of URLs, which could carry credentials.
 fn storage_error(err: StorageError) -> String {
     let hint = match &err {
         StorageError::NotFound(_) => " Check the path with list_folder or search_files.",
         StorageError::NotADirectory(_) => " Use get_file_info or read_text_file for a file.",
         StorageError::IsADirectory(_) => " Use list_folder to see what it contains.",
         StorageError::InvalidPath(_) => {
-            " Paths look like \"/Folder/file.txt\", relative to the shared folder's root."
+            " Paths look like \"/Folder/file.txt\", starting at the drive's root."
         }
-        StorageError::PermissionDenied(_) => "",
-        StorageError::TooManyEntries(_) => {
-            " Search a narrower path, such as a subfolder. (The server's owner can raise \
-             MAX_LISTING_BYTES; more than the default needs the Workers paid plan's CPU time.)"
+        StorageError::TooManyEntries(_) => " Search a narrower path, such as a subfolder.",
+        StorageError::Backend(_) | StorageError::Unhealthy(_) => {
+            " The file server may be offline; try again later."
         }
-        StorageError::Backend(_) => " The file server may be offline; try again later.",
+        StorageError::PermissionDenied(_)
+        | StorageError::AlreadyExists(_)
+        | StorageError::Protected(_)
+        | StorageError::Unsupported(_) => "",
     };
     let message = redact_urls(&err.to_string());
     let stop = if message.ends_with('.') { "" } else { "." };
@@ -760,6 +925,10 @@ fn redact_urls(text: &str) -> String {
         .map(|word| if word.contains("://") { "[url]" } else { word })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn seconds(duration: Duration) -> String {
+    format!("{} s", duration.as_secs())
 }
 
 /// The image type of an entry, from its content type or else its extension.
@@ -890,18 +1059,10 @@ mod tests {
     }
 
     #[test]
-    fn paths_under_folders() {
-        assert!(is_at_or_under("/a", "/a"));
-        assert!(is_at_or_under("/a/b", "/a"));
-        assert!(is_at_or_under("/a", "/"));
-        assert!(is_at_or_under("/", "/"));
-        assert!(!is_at_or_under("/ab", "/a"));
-        assert!(!is_at_or_under("/", "/a"));
-        assert!(is_under("/a/b", "/a"));
-        assert!(is_under("/a", "/"));
-        assert!(!is_under("/a", "/a"));
-        assert!(!is_under("/", "/"));
-        assert!(!is_under("/ab/c", "/a"));
+    fn cursors_round_trip() {
+        assert_eq!(decode_cursor(&encode_cursor(1000)), Some(1000));
+        assert_eq!(decode_cursor("nonsense"), None);
+        assert_eq!(decode_cursor(""), None);
     }
 
     #[test]

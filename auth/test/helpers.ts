@@ -1,7 +1,7 @@
 // Drives the Worker the way an MCP client and the owner's browser would.
 
 import { createExecutionContext } from "cloudflare:test";
-import { env, exports } from "cloudflare:workers";
+import { env } from "cloudflare:workers";
 import worker from "../src/index";
 
 export const ORIGIN = "https://chance-of-files.example.com";
@@ -34,10 +34,51 @@ export function freshIpv6Prefix(): (host: string) => string {
 	return (host) => `${prefix}:${host}`;
 }
 
-export function call(path: string, init: RequestInit = {}, ip = freshIp()): Promise<Response> {
+/** What the stub core saw of a forwarded request. */
+export interface Echo {
+	method: string;
+	url: string;
+	authorization: string | null;
+	cookie: string | null;
+	/** Every header, with lowercase names. */
+	headers: Record<string, string>;
+	body: string;
+}
+
+/**
+ * Stands in for the core behind the CORE VPC service, which only works remotely: echoes what
+ * reached it, so tests can check the token swap and the X-CoF-* headers.
+ */
+export const coreStub = {
+	async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+		const request = new Request(input, init);
+		const echo: Echo = {
+			method: request.method,
+			url: request.url,
+			authorization: request.headers.get("Authorization"),
+			cookie: request.headers.get("Cookie"),
+			headers: Object.fromEntries(request.headers),
+			body: await request.text(),
+		};
+		return Response.json(echo);
+	},
+} as Fetcher;
+
+/** The Worker's own env with the stub core in place of the CORE VPC binding. */
+export function testEnv(overrides: Partial<Env> = {}): Env {
+	return { ...env, CORE: coreStub, ...overrides };
+}
+
+/** A request from `ip`, through the Worker with the stub core. */
+export function call(path: string, init: RequestInit = {}, ip = freshIp(), overrides: Partial<Env> = {}): Promise<Response> {
 	const headers = new Headers(init.headers);
 	headers.set("CF-Connecting-IP", ip);
-	return exports.default.fetch(new Request(new URL(path, ORIGIN), { ...init, headers, redirect: "manual" }));
+	// The handler's type expects an incoming request's `cf` object, which a test request lacks.
+	const request = new Request(new URL(path, ORIGIN), { ...init, headers, redirect: "manual" }) as Request<
+		unknown,
+		IncomingRequestCfProperties
+	>;
+	return worker.fetch(request, testEnv(overrides), createExecutionContext());
 }
 
 /**
@@ -70,7 +111,7 @@ export async function callCountingKv(
 		unknown,
 		IncomingRequestCfProperties
 	>;
-	const response = await worker.fetch(request, { ...env, ...overrides, OAUTH_KV: counted }, createExecutionContext());
+	const response = await worker.fetch(request, testEnv({ ...overrides, OAUTH_KV: counted }), createExecutionContext());
 	return { response, writes };
 }
 
@@ -170,14 +211,31 @@ export interface Tokens {
 	token_type: string;
 }
 
+export interface SignInOptions {
+	/** The scope parameter the client sends to /authorize (default "files:read"). */
+	scope?: string;
+	/** Whether the owner ticks "Also allow changes". */
+	allowWrite?: boolean;
+}
+
 /** The browser part of the flow: register, sign in with the passphrase, return the code. */
-export async function authorizeCode(): Promise<{ client: Client; verifier: string; code: string }> {
+export async function authorizeCode(
+	options: SignInOptions = {},
+): Promise<{ client: Client; verifier: string; code: string }> {
 	const client = await registerPublicClient();
 	const { verifier, challenge } = await pkce();
-	const path = authorizeUrl({ client_id: client.client_id, code_challenge: challenge });
+	const path = authorizeUrl({
+		client_id: client.client_id,
+		code_challenge: challenge,
+		...(options.scope === undefined ? {} : { scope: options.scope }),
+	});
 	const ip = freshIp();
 	await openSignIn(path, ip);
-	const approved = await submitSignIn(path, ip, { passphrase: PASSPHRASE, decision: "approve" });
+	const approved = await submitSignIn(path, ip, {
+		passphrase: PASSPHRASE,
+		decision: "approve",
+		...(options.allowWrite ? { allow_write: "yes" } : {}),
+	});
 	const location = new URL(approved.headers.get("Location") ?? "");
 	return { client, verifier, code: location.searchParams.get("code") ?? "" };
 }
@@ -194,8 +252,8 @@ export function exchangeCode(client: Client, code: string, verifier: string): Pr
 }
 
 /** The whole flow up to tokens. */
-export async function signIn(): Promise<{ client: Client; tokens: Tokens }> {
-	const { client, verifier, code } = await authorizeCode();
+export async function signIn(options: SignInOptions = {}): Promise<{ client: Client; tokens: Tokens }> {
+	const { client, verifier, code } = await authorizeCode(options);
 	const response = await exchangeCode(client, code, verifier);
 	if (response.status !== 200) throw new Error(`token exchange failed: ${response.status} ${await response.text()}`);
 	return { client, tokens: await response.json() };

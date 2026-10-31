@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chance-of-files
+  labels:
+    # The API server sets this label too; having it in the manifest lets apply.sh apply the
+    # Namespace alone (-l) before it creates the Secret.
+    kubernetes.io/metadata.name: chance-of-files
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted

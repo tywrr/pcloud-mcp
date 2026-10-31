@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	CLAUDE_CALLBACK,
+	type Echo,
 	ORIGIN,
 	PASSPHRASE,
 	authorizeCode,
@@ -19,14 +20,6 @@ import {
 	submitSignIn,
 	token,
 } from "./helpers";
-
-interface Echo {
-	method: string;
-	url: string;
-	authorization: string | null;
-	cookie: string | null;
-	body: string;
-}
 
 /** Registers a client and returns the /authorize URL its sign-in starts at. */
 async function startSignIn(): Promise<{ path: string }> {

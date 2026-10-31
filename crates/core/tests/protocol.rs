@@ -2,7 +2,11 @@
 
 mod common;
 
-use chance_of_files_core::{ByteRange, Entry, ServerConfig, StorageError};
+use std::time::Duration;
+
+use chance_of_files_core::{
+    ByteRange, ByteStream, Capabilities, CheckedPath, Entry, ServerConfig, StorageError,
+};
 use common::*;
 use serde_json::{Value, json};
 
@@ -103,7 +107,7 @@ fn notifications_get_no_response() {
         "notifications/whatever",
     ] {
         let message = json!({"jsonrpc": "2.0", "method": method});
-        assert!(pollster::block_on(server.handle_jsonrpc(message)).is_none());
+        assert!(block_on(server.handle_jsonrpc(message)).is_none());
     }
 }
 
@@ -117,7 +121,7 @@ fn unknown_method_is_32601() {
 #[test]
 fn non_object_params_are_32602() {
     let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": [1]});
-    let response = pollster::block_on(server(sample_storage()).handle_jsonrpc(message)).unwrap();
+    let response = block_on(server(sample_storage()).handle_jsonrpc(message)).unwrap();
     assert_eq!(response["error"]["code"], json!(-32602));
 }
 
@@ -286,7 +290,7 @@ fn instructions_end_with_the_owners_guide() {
             base_instructions()
         )
     );
-    assert_eq!(server.storage().take_calls(), ["read /AGENTS.md"]);
+    assert_eq!(server.storage().take_calls(), ["open /AGENTS.md"]);
     // 2026-07-28 clients get the same from server/discover.
     let discover = rpc(&server, "server/discover", json!({}));
     assert_eq!(discover["result"]["instructions"], json!(text));
@@ -375,34 +379,49 @@ fn a_long_guide_is_cut_at_8_kib_on_a_character_boundary() {
 struct HangingStorage;
 
 impl chance_of_files_core::Storage for HangingStorage {
-    async fn list(&self, path: &str) -> Result<Vec<Entry>, StorageError> {
-        Err(StorageError::NotFound(path.into()))
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
     }
-    async fn stat(&self, path: &str) -> Result<Entry, StorageError> {
-        Err(StorageError::NotFound(path.into()))
+    async fn list(&self, path: &CheckedPath) -> Result<Vec<Entry>, StorageError> {
+        Err(StorageError::NotFound(path.to_string()))
     }
-    async fn read(&self, _: &str, _: ByteRange) -> Result<Vec<u8>, StorageError> {
+    async fn walk(&self, _: &CheckedPath, _: &[CheckedPath]) -> Result<Vec<Entry>, StorageError> {
+        Ok(Vec::new())
+    }
+    async fn stat(&self, path: &CheckedPath, _: bool) -> Result<Entry, StorageError> {
+        Err(StorageError::NotFound(path.to_string()))
+    }
+    async fn open(
+        &self,
+        _: &CheckedPath,
+        _: Option<ByteRange>,
+    ) -> Result<ByteStream, StorageError> {
         std::future::pending().await
     }
-    async fn search(&self, _: &str, _: &str, _: usize) -> Result<Vec<Entry>, StorageError> {
-        Ok(Vec::new())
+    async fn health(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+fn zero_guide_timeout() -> ServerConfig {
+    ServerConfig {
+        guide_timeout: Duration::ZERO,
+        ..ServerConfig::default()
     }
 }
 
 #[test]
 fn a_guide_read_that_hangs_is_given_up_at_the_deadline() {
-    let server = chance_of_files_core::McpServer::new(HangingStorage, ServerConfig::default())
-        .with_guide_deadline(|| std::future::ready(()));
+    let server = chance_of_files_core::McpServer::new(HangingStorage, zero_guide_timeout());
     let params = json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}});
-    let response = pollster::block_on(server.handle_jsonrpc(request(1, "initialize", params)))
+    let response = block_on(server.handle_jsonrpc(request(1, "initialize", params)))
         .expect("initialize gets a response");
     assert_eq!(
         response["result"]["instructions"].as_str(),
         Some(base_instructions().as_str())
     );
-    let response =
-        pollster::block_on(server.handle_jsonrpc(request(2, "server/discover", json!({}))))
-            .expect("server/discover gets a response");
+    let response = block_on(server.handle_jsonrpc(request(2, "server/discover", json!({}))))
+        .expect("server/discover gets a response");
     assert_eq!(
         response["result"]["instructions"].as_str(),
         Some(base_instructions().as_str())
@@ -411,19 +430,20 @@ fn a_guide_read_that_hangs_is_given_up_at_the_deadline() {
 
 #[test]
 fn a_deadline_does_not_cut_off_a_guide_that_is_ready() {
-    let server = server(sample_storage().file("/AGENTS.md", "guide"))
-        .with_guide_deadline(|| std::future::ready(()));
+    let server = server_with(
+        sample_storage().file("/AGENTS.md", "guide"),
+        zero_guide_timeout(),
+    );
     assert!(instructions_of(&server).ends_with("\n\nguide"));
 }
 
 #[test]
 fn instructions_name_the_turned_off_folders() {
     assert!(!base_instructions().contains("Search is turned off under"));
-    let config = ServerConfig {
-        search_skip: vec!["/Backups/Immich".into(), "/Media".into()],
-        ..ServerConfig::default()
-    };
-    let text = instructions_of(&server_with(sample_storage(), config));
+    let text = instructions_of(&server_with_policy(
+        sample_storage(),
+        skipping(&["/Backups/Immich", "/Media"]),
+    ));
     assert!(
         text.ends_with(" Search is turned off under /Backups/Immich, /Media."),
         "{text}"

@@ -1,5 +1,5 @@
-# Format, lint and tests for the Rust crates, a release build of the core Worker's wasm, and the
-# auth front's typecheck and tests, on every push and pull request. Nothing is deployed.
+# Format, lint and tests for the Rust crates, a static arm64 build of the server, the deploy files,
+# and the auth front's typecheck and tests, on every push and pull request. Nothing is deployed.
 name: ci
 
 on:
@@ -21,8 +21,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # The WebDAV integration test runs the real `rclone serve webdav` on fixtures/webdav-root
-      # (it skips itself without rclone). Ubuntu's rclone is years old, so take the pinned release.
+      # The integration tests run the real rclone (they skip themselves without it). Ubuntu's
+      # rclone is years old, so take the pinned release.
       - name: Install rclone
         run: |
           curl -fsSLo "$RUNNER_TEMP/rclone.deb" https://downloads.rclone.org/v1.75.2/rclone-v1.75.2-linux-amd64.deb
@@ -32,28 +32,37 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
-  wasm:
+  # The image the cm3588 runs: a static aarch64 musl binary, as deploy/build-image.sh builds it.
+  cross:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
-          components: clippy
+          targets: aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      # worker-build takes a few minutes to compile, so keep the binary between runs.
-      - uses: actions/cache@v6
-        id: worker-build
         with:
-          path: ~/.cargo/bin/worker-build
-          key: worker-build-0.8.7-${{ runner.os }}
-      - if: steps.worker-build.outputs.cache-hit != 'true'
-        run: cargo install worker-build@0.8.7 --locked
-      # The Worker crate's Workers-only code is compiled only for wasm32, so lint it there too.
-      - run: cargo clippy --workspace --target wasm32-unknown-unknown --locked -- -D warnings
-      - name: worker-build --release
-        working-directory: crates/worker
-        run: worker-build --release
+          key: aarch64-musl
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.24.0
+      - run: cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --bin chance-of-files
+      - name: Pack the OCI archive
+        run: |
+          bin=target/aarch64-unknown-linux-musl/release/chance-of-files
+          file "$bin" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
+          python3 deploy/oci-image.py "$bin" arm64 localhost/chance-of-files:ci "$RUNNER_TEMP/image.tar"
+
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Both preinstalled on the runner image.
+      - run: shellcheck deploy/*.sh deploy/k8s/*.sh
+      - run: kubectl kustomize deploy/k8s/base >/dev/null
 
   auth:
     runs-on: ubuntu-latest

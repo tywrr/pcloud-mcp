@@ -9,6 +9,9 @@
 // checks the passphrase, then parses and checks that request again from scratch and completes the
 // authorization, which writes the grant: only the owner can make this page write to KV.
 //
+// The grant always has files:read. It gets files:write only if the owner ticked "Also allow
+// changes", which is unticked on every page this Worker renders, whatever the client asked for.
+//
 // The passphrase is also the CSRF protection. Nothing ties the POST to an earlier GET, and nothing
 // needs to: a page on another site can make the owner's browser post this form, but it doesn't
 // know the passphrase, so it can't approve anything. All it can do is deny, which sends an
@@ -77,7 +80,9 @@ async function submitSignIn(request: Request, env: AppEnv, policy: RedirectPolic
 		request: authRequest,
 		userId: OWNER_USER_ID,
 		metadata: { approvedAt: new Date().toISOString() },
-		scope: grantedScopes(authRequest.scope),
+		// Only the owner's tick grants files:write; the form field is trusted for that because the
+		// passphrase just proved the owner posted it.
+		scope: grantedScopes(authRequest.scope, form.get("allow_write") === "yes"),
 		props: {},
 	});
 	return redirect(redirectTo);
@@ -104,7 +109,12 @@ function refuse(authRequest: AuthRequest, policy: RedirectPolicy): Response | un
 async function consentPage(env: AppEnv, authRequest: AuthRequest, wrong?: { error: string }): Promise<Response> {
 	const details = await env.OAUTH_PROVIDER.describeConsent(authRequest);
 	return htmlResponse(
-		(nonce) => signInPage(nonce, { details, scopes: grantedScopes(authRequest.scope), error: wrong?.error }),
+		(nonce) =>
+			signInPage(nonce, {
+				details,
+				scopes: grantedScopes(authRequest.scope, false),
+				error: wrong?.error,
+			}),
 		{ status: wrong ? 401 : 200, formAction: formTargets(authRequest) },
 	);
 }
@@ -115,6 +125,8 @@ async function wrongPassphrase(request: Request, env: AppEnv, policy: RedirectPo
 	if (!authRequest || refuse(authRequest, policy)) {
 		return messageResponse(401, "Wrong passphrase", "Start the sign-in again from Claude.");
 	}
+	// The write box comes back unticked: a cross-site POST also lands here, and must not be able
+	// to pre-tick it for the owner.
 	return consentPage(env, authRequest, { error: "Wrong passphrase. Try again." });
 }
 

@@ -1,41 +1,41 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/webdav", "crates/worker"]
+members = ["crates/core", "crates/rclone", "crates/server"]
 # Throwaway measurement tools (docs/design/v2.md, phase 0), each its own Cargo project.
-exclude = ["spikes"]
+# crates/webdav is parked: it was written for Workers (single-threaded, non-Send futures, a
+# per-request CPU budget) and gets ported to the Send storage traits when it gains writes.
+exclude = ["spikes", "crates/webdav"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tywrr/chance-of-files"
 
 [workspace.dependencies]
 chance-of-files-core = { path = "crates/core" }
-chance-of-files-webdav = { path = "crates/webdav" }
+chance-of-files-rclone = { path = "crates/rclone" }
 
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"
+bytes = "1.12.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+http-body-util = "0.1.5"
 percent-encoding = "2.3.2"
-quick-xml = "0.42.0"
-# Only the protocol types: rmcp's service runtime needs tokio, which doesn't run on Workers.
+# Plain HTTP only: the rclone rc API is on loopback, and leaving TLS out keeps OpenSSL and
+# aws-lc (C toolchains) out of the static musl build.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+# Only the protocol types: the core keeps its own stateless endpoint (design D1).
 rmcp = { version = "3.8.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.149"
-worker = "0.8.7"
-httpdate = "1.0.3"
 # Constant-time comparison of the internal bearer token.
 subtle = "2.6.1"
-pollster = "0.4.0"
-# Native blocking HTTP client for the WebDAV integration tests (plain http to a local rclone).
-ureq = { version = "3.5.0", default-features = false }
+tokio = { version = "1.54.1", features = ["time"] }
+trait-variant = "0.1.2"
 
-# Small wasm: one codegen unit + LTO let the optimiser see the whole program, and
-# opt-level "s" trades a little speed for size (Workers bills CPU, but startup scales with size).
+# One static binary per arch; thin LTO keeps cross builds reasonably quick.
 [profile.release]
-codegen-units = 1
-lto = true
-# Only debug info: worker-build 0.8.7's wasm-bindgen reads the target_features section to
-# turn on reference types, and `strip = true` removes it ("externref table required for catch
-# wrappers"). The name section that stays (~125 kB) also makes panic stack traces readable.
-strip = "debuginfo"
-opt-level = "s"
+codegen-units = 4
+lto = "thin"
+strip = true

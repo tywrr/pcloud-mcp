@@ -14,7 +14,7 @@ describe("discovery", () => {
 			response_types_supported: ["code"],
 			code_challenge_methods_supported: ["S256"],
 			client_id_metadata_document_supported: true,
-			scopes_supported: ["files:read", "offline_access"],
+			scopes_supported: ["files:read", "files:write", "offline_access"],
 		});
 		expect(metadata.token_endpoint_auth_methods_supported).toContain("none");
 		// /token refuses client assertions, so they aren't advertised.

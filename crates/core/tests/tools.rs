@@ -131,7 +131,6 @@ fn too_many_entries_tells_the_model_to_narrow_the_path() {
         assert_tool_error(&result, "too many entries to go through at once: /huge");
         let message = text(&result);
         assert!(message.contains("Search a narrower path"), "{message}");
-        assert!(message.contains("MAX_LISTING_BYTES"), "{message}");
     }
 }
 
@@ -601,13 +600,6 @@ fn drive() -> MemoryStorage {
         .too_big("/Backups/Immich")
 }
 
-fn skipping(folders: &[&str]) -> ServerConfig {
-    ServerConfig {
-        search_skip: folders.iter().map(|&f| f.to_owned()).collect(),
-        ..ServerConfig::default()
-    }
-}
-
 fn found_paths(text: &str) -> Vec<&str> {
     text.lines()
         .filter_map(|line| line.split(") path: ").nth(1))
@@ -620,7 +612,7 @@ fn search_goes_around_a_turned_off_folder() {
     let result = call(&server(drive()), "search_files", json!({"query": "report"}));
     assert_tool_error(&result, "too many entries");
 
-    let server = server_with(drive(), skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(drive(), skipping(&["/Backups/Immich"]));
     let result = call(&server, "search_files", json!({"query": "report"}));
     assert!(!is_error(&result), "{result}");
     let found = text(&result);
@@ -653,9 +645,9 @@ fn search_goes_around_a_turned_off_folder() {
         [
             "list /",
             "list /Backups",
-            "search /Backups/phone",
-            "search /Projects",
-            "search /R\u{e9}ports"
+            "walk /Backups/phone",
+            "walk /Projects",
+            "walk /R\u{e9}ports"
         ]
     );
 }
@@ -667,7 +659,7 @@ fn server_storage_calls(server: &chance_of_files_core::McpServer<MemoryStorage>)
 
 #[test]
 fn a_turned_off_folder_at_the_top_still_matches_by_name() {
-    let server = server_with(drive(), skipping(&["/Backups"]));
+    let server = server_with_policy(drive(), skipping(&["/Backups"]));
     let found = text(&call(&server, "search_files", json!({"query": "back"})));
     assert_eq!(found_paths(&found), ["/Backups"], "{found}");
     assert!(found.contains("Skipped /Backups: search is turned off there."));
@@ -682,7 +674,7 @@ fn a_turned_off_folder_at_the_top_still_matches_by_name() {
 #[test]
 fn turned_off_folders_match_ignoring_case_and_accents() {
     // The owner typed the folders differently from how list_folder shows them.
-    let server = server_with(drive(), skipping(&["/backups/IMMICH", "/Re\u{301}ports"]));
+    let server = server_with_policy(drive(), skipping(&["/backups/IMMICH", "/Re\u{301}ports"]));
     let found = text(&call(&server, "search_files", json!({"query": "report"})));
     assert!(
         found.contains("Skipped /Backups/Immich, /R\u{e9}ports: search is turned off there."),
@@ -702,7 +694,7 @@ fn turned_off_folders_match_ignoring_case_and_accents() {
 
 #[test]
 fn searching_at_or_under_a_turned_off_folder_is_refused() {
-    let server = server_with(drive(), skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(drive(), skipping(&["/Backups/Immich"]));
     for path in [
         "/Backups/Immich",
         "/Backups/Immich/library",
@@ -722,7 +714,7 @@ fn searching_at_or_under_a_turned_off_folder_is_refused() {
     }
     assert!(server_storage_calls(&server).is_empty());
     // A sibling whose name only starts the same is not under it.
-    let server = server_with(
+    let server = server_with_policy(
         drive().file("/Backups/Immich-old/a.jpg", "x"),
         skipping(&["/Backups/Immich"]),
     );
@@ -736,7 +728,7 @@ fn searching_at_or_under_a_turned_off_folder_is_refused() {
 
 #[test]
 fn a_search_with_nothing_turned_off_inside_is_one_call() {
-    let server = server_with(drive(), skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(drive(), skipping(&["/Backups/Immich"]));
     let found = text(&call(
         &server,
         "search_files",
@@ -748,12 +740,12 @@ fn a_search_with_nothing_turned_off_inside_is_one_call() {
         "{found}"
     );
     assert!(!found.contains("Skipped"), "{found}");
-    assert_eq!(server_storage_calls(&server), ["search /Projects"]);
+    assert_eq!(server_storage_calls(&server), ["walk /Projects"]);
 }
 
 #[test]
 fn a_split_search_stops_at_the_limit() {
-    let server = server_with(drive(), skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(drive(), skipping(&["/Backups/Immich"]));
     let found = text(&call(
         &server,
         "search_files",
@@ -771,13 +763,13 @@ fn a_split_search_stops_at_the_limit() {
     // Nothing after the second match is looked at.
     assert_eq!(
         server_storage_calls(&server),
-        ["list /", "list /Backups", "search /Backups/phone"]
+        ["list /", "list /Backups", "walk /Backups/phone"]
     );
 }
 
 #[test]
 fn a_subfolder_too_big_to_search_is_noted() {
-    let server = server_with(
+    let server = server_with_policy(
         drive().too_big("/Projects/beta"),
         skipping(&["/Backups/Immich"]),
     );
@@ -802,7 +794,7 @@ fn a_subfolder_too_big_to_search_is_noted() {
         "{found}"
     );
     // A folder above the turned-off one that is itself too big to list is noted the same way.
-    let server = server_with(drive().too_big("/Backups"), skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(drive().too_big("/Backups"), skipping(&["/Backups/Immich"]));
     let found = text(&call(&server, "search_files", json!({"query": "report"})));
     assert!(
         found.contains("too many entries to go through in one call: /Backups."),
@@ -819,7 +811,7 @@ fn a_search_that_could_search_nothing_is_an_error() {
         .file("/Media/c.mp4", "x")
         .too_big("/Backups/Old")
         .too_big("/Media");
-    let server = server_with(storage, skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(storage, skipping(&["/Backups/Immich"]));
     let result = call(&server, "search_files", json!({"query": "zzz"}));
     assert!(is_error(&result), "{result}");
     assert_eq!(
@@ -839,7 +831,7 @@ fn a_search_that_could_search_nothing_is_an_error() {
 
 #[test]
 fn a_split_search_with_no_matches_says_what_it_left_out() {
-    let server = server_with(drive(), skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(drive(), skipping(&["/Backups/Immich"]));
     let found = text(&call(&server, "search_files", json!({"query": "IMG_0001"})));
     assert_eq!(
         found,
@@ -851,7 +843,7 @@ fn a_split_search_with_no_matches_says_what_it_left_out() {
 
 #[test]
 fn a_split_search_stops_when_the_backend_fails() {
-    let server = server_with(drive().dir("/broken"), skipping(&["/Backups/Immich"]));
+    let server = server_with_policy(drive().dir("/broken"), skipping(&["/Backups/Immich"]));
     let result = call(&server, "search_files", json!({"query": "report"}));
     assert!(!is_error(&result), "{result}");
     let found = text(&result);
@@ -876,7 +868,7 @@ fn a_split_search_stops_when_the_backend_fails() {
         "{found}"
     );
     // The root itself failing is an ordinary error.
-    let server = server_with(drive(), skipping(&["/broken/x"]));
+    let server = server_with_policy(drive(), skipping(&["/broken/x"]));
     let result = call(
         &server,
         "search_files",
@@ -885,17 +877,53 @@ fn a_split_search_stops_when_the_backend_fails() {
     assert_tool_error(&result, "storage backend error");
 }
 
-#[test]
-fn a_split_search_makes_at_most_40_calls() {
-    let mut storage = MemoryStorage::new().file("/Huge/photos/x.jpg", "x");
-    for i in 0..60 {
-        storage = storage.file(&format!("/f{i:02}/report-{i:02}.txt"), "x");
+fn short_deadline() -> ServerConfig {
+    ServerConfig {
+        deadline: std::time::Duration::from_millis(50),
+        ..ServerConfig::default()
     }
-    let server = server_with(storage, skipping(&["/Huge/photos"]));
-    let found = text(&call(&server, "search_files", json!({"query": "zzz"})));
-    assert!(
-        found.contains("The search stopped early because it reached its limit of 40 folders"),
+}
+
+#[test]
+fn a_split_search_returns_what_it_has_at_the_deadline() {
+    let storage = drive().hanging("/Projects");
+    let server = server_with(storage, short_deadline()).with_policy(skipping(&["/Backups/Immich"]));
+    let result = call(&server, "search_files", json!({"query": "report"}));
+    assert!(!is_error(&result), "{result}");
+    let found = text(&result);
+    assert_eq!(
+        found_paths(&found),
+        [
+            "/Backups/phone/report-2025.pdf",
+            "/Backups/report-index.txt"
+        ],
         "{found}"
     );
-    assert_eq!(server_storage_calls(&server).len(), 40);
+    assert!(
+        found.contains("The search stopped early because it reached the 0 s time limit"),
+        "{found}"
+    );
+    // Nothing after the deadline is asked for.
+    assert_eq!(
+        server_storage_calls(&server),
+        [
+            "list /",
+            "list /Backups",
+            "walk /Backups/phone",
+            "walk /Projects"
+        ]
+    );
+}
+
+#[test]
+fn single_calls_past_the_deadline_fail_with_a_clear_message() {
+    let server = server_with(sample_storage().hanging("/Notes"), short_deadline());
+    let result = call(&server, "list_folder", json!({"path": "/Notes"}));
+    assert_tool_error(&result, "didn't answer within the 0 s time limit");
+    let result = call(
+        &server,
+        "search_files",
+        json!({"query": "x", "path": "/Notes"}),
+    );
+    assert_tool_error(&result, "Nothing under /Notes could be searched");
 }

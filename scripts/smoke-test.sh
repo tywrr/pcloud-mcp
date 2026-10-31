@@ -2,10 +2,10 @@
 # Exercises a running MCP endpoint with the MCP Inspector CLI: tools/list, then every tool
 # once. Exits non-zero on the first failure.
 #
-#   scripts/smoke-test.sh                      # the core under `wrangler dev`, dev token
+#   scripts/smoke-test.sh                      # the server from `mise run dev` (http://127.0.0.1:8080/mcp), dev token
 #   scripts/smoke-test.sh URL TOKEN            # any endpoint and bearer token
 #
-# The defaults match crates/worker/.dev.vars.example and the files in fixtures/webdav-root.
+# The defaults match deploy/dev.sh and the files in fixtures/webdav-root.
 # Against a real pCloud folder, point the tool arguments at files that exist there:
 #   SMOKE_TEXT_FILE   file for get_file_info and read_text_file (default /Café menu.txt)
 #   SMOKE_IMAGE       picture for read_image (default /images/pixel.png)
@@ -16,7 +16,7 @@
 # a real one, run this somewhere you trust.
 set -euo pipefail
 
-url="${1:-http://127.0.0.1:8787/mcp}"
+url="${1:-http://127.0.0.1:8080/mcp}"
 token="${2:-dev-internal-token}"
 text_file="${SMOKE_TEXT_FILE:-/Café menu.txt}"
 image="${SMOKE_IMAGE:-/images/pixel.png}"

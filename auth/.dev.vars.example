@@ -5,3 +5,6 @@ OWNER_PASSPHRASE=dev-passphrase
 # Vars from wrangler.jsonc can be overridden here too. The default DCR_ALLOWED_CIDRS already lets
 # loopback register clients, which is where local requests come from.
 # DCR_ALLOWED_CIDRS=*
+# The core on this computer (crates/server, listening on 127.0.0.1:8080), instead of the CORE VPC
+# binding, which only works remotely. Loopback origins only.
+# CORE_URL=http://127.0.0.1:8080

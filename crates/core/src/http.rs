@@ -1,4 +1,6 @@
-//! Runtime-neutral HTTP types, so the endpoint logic can be tested natively.
+//! Plain HTTP types, so the endpoint logic is tested without a web framework.
+
+use crate::scope::Scopes;
 
 #[derive(Debug, Clone, Default)]
 pub struct HttpRequest {
@@ -8,6 +10,9 @@ pub struct HttpRequest {
     /// Header names in any case; look them up with [`HttpRequest::header`].
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// What the client may do. Set by the server from a header it trusts only after
+    /// authenticating the request; the core never reads scopes from `headers` itself.
+    pub scopes: Scopes,
 }
 
 impl HttpRequest {

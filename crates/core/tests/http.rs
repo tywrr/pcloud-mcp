@@ -7,7 +7,7 @@ use common::*;
 use serde_json::{Value, json};
 
 fn send(req: HttpRequest) -> chance_of_files_core::HttpResponse {
-    pollster::block_on(server(sample_storage()).handle_http(req))
+    block_on(server(sample_storage()).handle_http(req))
 }
 
 fn ping() -> Value {
@@ -215,11 +215,10 @@ fn allowed_origin_passes() {
         "HTTPS://CLAUDE.AI",
         "http://localhost:6274",
     ] {
-        let resp =
-            pollster::block_on(server.handle_http(with_header(post(&ping()), "Origin", origin)));
+        let resp = block_on(server.handle_http(with_header(post(&ping()), "Origin", origin)));
         assert_eq!(resp.status, 200, "{origin}");
     }
-    let resp = pollster::block_on(server.handle_http(with_header(
+    let resp = block_on(server.handle_http(with_header(
         post(&ping()),
         "Origin",
         "https://claude.ai.evil.example",

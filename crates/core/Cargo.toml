@@ -1,6 +1,6 @@
 [package]
 name = "chance-of-files-core"
-description = "MCP (Model Context Protocol) server logic and file tools for Chance of Files, independent of the storage backend and runtime"
+description = "MCP (Model Context Protocol) endpoint, file tools, storage traits and path policy for Chance of Files, independent of the storage backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,16 @@ repository.workspace = true
 
 [dependencies]
 base64.workspace = true
-# NFD for accent-insensitive search. The Worker already links it (url's IDNA support uses
-# it), so this adds only about 11 kB to the gzipped wasm.
+bytes.workspace = true
+futures-util.workspace = true
+# NFD for case- and accent-insensitive name matching and path policy.
 icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Deadlines on storage calls; the caller provides the runtime.
+tokio.workspace = true
+trait-variant.workspace = true
 
 [dev-dependencies]
-pollster = "0.4.0"
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

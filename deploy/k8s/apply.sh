@@ -1,51 +1,101 @@
 #!/usr/bin/env bash
-# Deploys the Chance of Files backend (rclone + cloudflared, backend.yaml) to the cluster in $KUBECONFIG.
-#   deploy/k8s/apply.sh            create the Secret if missing, apply, wait for the tunnel
-#   deploy/k8s/apply.sh --rotate   replace the Secret from the files below, then restart the pod
+# Deploys Chance of Files to the cluster in $KUBECONFIG: the Secret from local files, then the
+# kustomize base (or your overlay), then waits for the rollout, the tunnel and /readyz.
 #
-# The Secret is built from local files and never printed:
-#   RCLONE_REMOTE           rclone remote holding the pCloud token (default chance-of-files; `rclone config create chance-of-files pcloud`)
-#   CHANCE_OF_FILES_CONFIG  folder with tunnel-token, webdav.env (RCLONE_PASS=...) and filter.txt
-#                           (default ~/.config/chance-of-files, as in docs/setup.md)
+#   deploy/k8s/apply.sh [DIR]            create the Secret if missing, apply DIR (default: the base)
+#   deploy/k8s/apply.sh --rotate [DIR]   replace the Secret from the files below, then restart the pod
+#
+# DIR is any kustomization (a directory with kustomization.yaml) that builds on deploy/k8s/base.
+#
+# The Secret chance-of-files is built from local files and never printed:
+#   $COF_SECRETS_DIR (default ~/.config/chance-of-files), mode 700:
+#     tunnel-token     the tunnel's eyJ... token (required)
+#     internal-token   the auth Worker's INTERNAL_TOKEN; made here if missing (set the same value
+#                      on the Worker: docs/setup.md)
+#     rc-pass          rclone's rc password, used only inside the pod; made here if missing
+#   $RCLONE_REMOTE (default chance-of-files): an authorised rclone pcloud remote on this machine
+#     (`rclone config create chance-of-files pcloud`); its token and API host go into the Secret.
+#
+# $COF_EXPECT_NODE, if set, makes the script refuse unless the cluster's only node has that name
+# (a guard against the wrong kubeconfig). $COF_LOCAL_PORT (default 18080) is the local port of the
+# /readyz check.
 set -euo pipefail
-cd "$(dirname "$0")"
-remote=${RCLONE_REMOTE:-chance-of-files}
-dir=${CHANCE_OF_FILES_CONFIG:-$HOME/.config/chance-of-files}
-k() { kubectl -n chance-of-files "$@"; }
 
-for f in tunnel-token webdav.env filter.txt; do
-  [ -s "$dir/$f" ] || { echo "missing $dir/$f" >&2; exit 1; }
+rotate=0
+if [ "${1:-}" = --rotate ]; then rotate=1; shift; fi
+dir=${1:-"$(dirname "$0")/base"}
+[ -f "$dir/kustomization.yaml" ] || { echo "no kustomization.yaml in $dir" >&2; exit 1; }
+secrets=${COF_SECRETS_DIR:-$HOME/.config/chance-of-files}
+remote=${RCLONE_REMOTE:-chance-of-files}
+ns=chance-of-files
+k() { kubectl -n "$ns" "$@"; }
+
+if [ -n "${COF_EXPECT_NODE:-}" ]; then
+  node=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}')
+  [ "$node" = "$COF_EXPECT_NODE" ] || { echo "refusing: cluster node is '$node', not $COF_EXPECT_NODE" >&2; exit 1; }
+fi
+
+[ -s "$secrets/tunnel-token" ] || { echo "missing $secrets/tunnel-token" >&2; exit 1; }
+for f in internal-token rc-pass; do
+  if [ ! -s "$secrets/$f" ]; then
+    (umask 077 && openssl rand -hex 32 | tr -d '\n' >"$secrets/$f")
+    echo "made $secrets/$f"
+  fi
 done
 
-kubectl apply -f namespace.yaml
+# The Namespace first and alone (its manifest carries the selected label), so the Secret can exist
+# before the pod does.
+kubectl apply -k "$dir" -l kubernetes.io/metadata.name="$ns"
 
-if [ "${1:-}" = --rotate ]; then
-  k delete secret chance-of-files-backend --ignore-not-found
+created=0
+if [ "$rotate" = 1 ]; then
+  k delete secret chance-of-files --ignore-not-found
 fi
-if ! k get secret chance-of-files-backend >/dev/null 2>&1; then
+if ! k get secret chance-of-files >/dev/null 2>&1; then
   # `rclone config dump` is JSON; the token is itself a JSON string inside it.
   dump=$(rclone config dump)
   field() { jq -er --arg r "$remote" --arg f "$1" '.[$r][$f]' <<<"$dump"; }
   [ "$(field type)" = pcloud ] || { echo "rclone remote '$remote' is not a pcloud remote" >&2; exit 1; }
+  # Read into variables so a missing field stops the script instead of creating an empty key.
+  tok=$(field token | tr -d '\n'); host=$(field hostname | tr -d '\n')
+  [ -n "$tok" ] && [ -n "$host" ] || { echo "rclone remote '$remote' has no token or hostname" >&2; exit 1; }
   # `create`, not apply: apply would copy the values into an annotation.
-  k create secret generic chance-of-files-backend \
-    --from-file=pcloud-token=<(field token | tr -d '\n') \
-    --from-file=pcloud-hostname=<(field hostname | tr -d '\n') \
-    --from-file=webdav-password=<(sed -n 's/^RCLONE_PASS=//p' "$dir/webdav.env" | tr -d '\n') \
-    --from-file=tunnel-token=<(tr -d '\n' <"$dir/tunnel-token") \
-    --from-file=filter.txt="$dir/filter.txt"
+  k create secret generic chance-of-files \
+    --from-file=internal-token=<(tr -d '\n' <"$secrets/internal-token") \
+    --from-file=rc-pass=<(tr -d '\n' <"$secrets/rc-pass") \
+    --from-file=pcloud-token=<(printf %s "$tok") \
+    --from-file=pcloud-hostname=<(printf %s "$host") \
+    --from-file=tunnel-token=<(tr -d '\n' <"$secrets/tunnel-token")
   unset dump
-  [ "${1:-}" = --rotate ] && k rollout restart deploy/chance-of-files-backend 2>/dev/null || true
+  created=1
 fi
 
-kubectl apply -f backend.yaml
-k rollout status deploy/chance-of-files-backend --timeout=180s
+kubectl apply -k "$dir"
+# A pod that started before a new Secret existed keeps the old env until it restarts.
+if [ "$rotate" = 1 ] && [ "$created" = 1 ]; then
+  k rollout restart deploy/chance-of-files
+fi
+k rollout status deploy/chance-of-files --timeout=300s
 
-# cloudflared logs one line per registered connection; expect four, all quic.
-for _ in $(seq 1 15); do
-  n=$(k logs deploy/chance-of-files-backend -c cloudflared 2>/dev/null | grep -c 'Registered tunnel connection' || true)
+# cloudflared logs one line per registered connection; expect four.
+n=0
+for _ in $(seq 1 30); do
+  n=$(k logs deploy/chance-of-files -c cloudflared 2>/dev/null | grep -c 'Registered tunnel connection' || true)
   [ "$n" -ge 4 ] && break
   sleep 2
 done
 echo "tunnel connections registered: $n"
-k logs deploy/chance-of-files-backend -c rclone --tail=5
+
+# The core listens on the pod's loopback only; port-forward connects there.
+port=${COF_LOCAL_PORT:-18080}
+k port-forward deploy/chance-of-files "$port:8080" >/dev/null 2>&1 &
+pf=$!
+trap 'kill "$pf" 2>/dev/null || true' EXIT
+ready=""
+for _ in $(seq 1 15); do
+  ready=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/readyz" || true)
+  [ "$ready" = 200 ] && break
+  sleep 2
+done
+echo "readyz: ${ready:-no answer}"
+[ "$n" -ge 4 ] && [ "$ready" = 200 ] || { k logs deploy/chance-of-files -c core --tail=20 >&2; exit 1; }

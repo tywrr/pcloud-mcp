@@ -2,11 +2,16 @@
 //
 // It is the URL you add to Claude as a custom connector (https://<this Worker>/mcp). It signs
 // Claude in (OAuth 2.1 with PKCE, Client ID Metadata Documents or Dynamic Client Registration),
-// and forwards authorized /mcp requests to the Rust Worker "chance-of-files-core" over a service
-// binding, which has no public URL of its own.
+// and forwards authorized /mcp requests to the core in your cluster over a Workers VPC service
+// (binding CORE), which has no public URL of its own.
 //
-// Secrets (set with `npx wrangler secret put NAME`, never in this file; locally in .dev.vars):
-//   INTERNAL_TOKEN    the same value as the core Worker's INTERNAL_TOKEN. The core accepts only
+// This file is the public template. Deploy from a copy with your own VPC service id:
+//   cp wrangler.jsonc wrangler.personal.jsonc   # gitignored; replace <SERVICE_ID> in the copy
+//   npx wrangler deploy -c wrangler.personal.jsonc   (or `npm run deploy`)
+//
+// Secrets (set with `npx wrangler secret put NAME -c wrangler.personal.jsonc`, never in this file;
+// locally in .dev.vars):
+//   INTERNAL_TOKEN    the same value as the core's INTERNAL_TOKEN. The core accepts only
 //                     requests that carry it, so Claude's own access tokens never reach it.
 //   OWNER_PASSPHRASE  what you type on the sign-in page. Use a long random one, for example
 //                     the output of `openssl rand -base64 24`; anyone who knows it can connect.
@@ -41,7 +46,12 @@
 		// (anyone using Claude can send requests from it, so it isn't on by default). To connect a
 		// client that registers itself from your computer, such as the MCP Inspector, add your
 		// address for a moment, or "*".
-		"DCR_ALLOWED_CIDRS": "127.0.0.0/8,::1"
+		"DCR_ALLOWED_CIDRS": "127.0.0.0/8,::1",
+		// Local development only: a loopback origin such as "http://127.0.0.1:8080" sends /mcp to a
+		// core running on this computer instead of through CORE. Anything but a loopback http
+		// origin is refused, and a deployed Worker can't reach loopback, so leave it empty here and
+		// set it in .dev.vars.
+		"CORE_URL": ""
 	},
 	// Wrangler refuses to deploy without these, and warns in `wrangler dev` when .dev.vars lacks
 	// them. A brand-new Worker can't have secrets yet, so the first deploy passes them in a file:
@@ -50,10 +60,12 @@
 	// Clients, grants and tokens (tokens are stored only as hashes). With no "id", wrangler
 	// creates the namespace on the first deploy and keeps it linked.
 	"kv_namespaces": [{ "binding": "OAUTH_KV" }],
-	"services": [
-		// The Rust Worker that serves the MCP tools. It must be deployed first.
-		{ "binding": "MCP_CORE", "service": "chance-of-files-core" }
-	],
+	// The core: a Workers VPC service pointing at 127.0.0.1:8080 through your tunnel, created with
+	//   npx wrangler vpc service create chance-of-files --type http --tunnel-id <TUNNEL_ID> --ipv4 127.0.0.1 --http-port 8080
+	// `npx wrangler vpc service list` shows its id again. VPC services have no local simulation:
+	// `npm run dev` (wrangler dev --local) can't use CORE, so set CORE_URL in .dev.vars to a core
+	// on this computer; `npm run dev:tunnel` uses your real id and tunnel (needs `wrangler login`).
+	"vpc_services": [{ "binding": "CORE", "service_id": "<SERVICE_ID>", "remote": true }],
 	// Approximate per-IP limits (an IPv6 caller's whole /64 counts as one address), counted
 	// separately in each Cloudflare location. They slow down passphrase guessing and floods; a
 	// long passphrase is what actually keeps people out. They don't guard the free plan's 1,000 KV

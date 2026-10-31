@@ -1,45 +1,40 @@
 # Tools and tasks for working on chance-of-files. `mise install` once, then `mise run <task>`; `mise tasks`
-# lists them. Rust comes from rustup, not mise (see docs/development.md): rustup target add
-# wasm32-unknown-unknown && cargo install worker-build@0.8.7.
+# lists them. Rust comes from rustup, not mise (see docs/development.md).
 [tools]
 node = "26"
-# The same wrangler as auth/package.json, so both Workers are built and run by one version.
+# The same wrangler as auth/package.json.
 "npm:wrangler" = "4.156.0"
+# The server's backend, also run by the integration tests (they skip themselves without it).
+rclone = "1.75.2"
 
 # ------------------------------------------------------------------------------
-# Local loop: backend, dev and (optionally) dev:auth in three terminals, then smoke.
+# Local loop: dev, then smoke (and optionally dev:auth) in other terminals.
 # ------------------------------------------------------------------------------
-[tasks.backend]
-description = "Serve fixtures/webdav-root read-only over WebDAV on 127.0.0.1:8081 (mcp / dev-password): mise run backend -- [DIR]"
-run = "scripts/dev-backend.sh"
-
-# Reads crates/worker/.dev.vars (copy it from .dev.vars.example). The first run compiles the wasm
-# with worker-build, which takes a minute; later runs rebuild only on change.
 [tasks.dev]
-description = "Run the Rust core Worker locally on http://127.0.0.1:8787/mcp (wrangler dev)"
-dir = "crates/worker"
-run = "wrangler dev"
+description = "rclone rcd over fixtures/webdav-root + the server on http://127.0.0.1:8080/mcp: mise run dev -- [DIR | REMOTE:PATH]"
+run = "deploy/dev.sh"
 
-# The MCP_CORE service binding finds the core through wrangler's local dev registry, so keep
-# `mise run dev` running in another terminal.
+# Needs CORE_URL=http://127.0.0.1:8080 in auth/.dev.vars, so the front reaches `mise run dev`.
 [tasks."dev:auth"]
 description = "Run the OAuth front locally on http://127.0.0.1:8788/mcp (needs `mise run dev` alongside)"
 dir = "auth"
 run = ["test -d node_modules || npm ci", "npm run dev"]
 
 [tasks.smoke]
-description = "tools/list and every tool through the MCP Inspector CLI: mise run smoke -- [URL] [TOKEN]"
-run = "scripts/smoke-test.sh"
+description = "tools/list and every tool through the MCP Inspector CLI (default: the local server and dev token)"
+usage = '''
+arg "[url]" default="http://127.0.0.1:8080/mcp"
+arg "[token]" default="dev-internal-token"
+'''
+run = 'scripts/smoke-test.sh "$usage_url" "$usage_token"'
 
 [tasks.inspector]
-description = "Open the MCP Inspector web UI (connect to http://127.0.0.1:8787/mcp with an Authorization header)"
+description = "Open the MCP Inspector web UI (connect to http://127.0.0.1:8080/mcp with an Authorization header)"
 run = "npx -y @modelcontextprotocol/inspector@2.13.0"
 
 # ------------------------------------------------------------------------------
 # Checks: the same steps CI runs (.github/workflows/ci.yml).
 # ------------------------------------------------------------------------------
-# The WebDAV integration test starts its own rclone on the fixtures, and skips itself when rclone
-# isn't installed.
 [tasks.test]
 description = "cargo test --workspace, then the auth front's tests"
 run = [
@@ -47,24 +42,37 @@ run = [
   "cd auth && (test -d node_modules || npm ci) && npm test",
 ]
 
-[tasks.build]
-description = "Build the core Worker's wasm (worker-build --release) and bundle the auth front without deploying"
-run = [
-  "cd crates/worker && worker-build --release",
-  "cd auth && (test -d node_modules || npm ci) && npx wrangler deploy --dry-run --outdir ../target/auth-dist",
-]
-
 [tasks.fmt]
 description = "Format the Rust code (cargo fmt)"
 run = "cargo fmt --all"
 
-# Clippy runs twice: natively for the tests, and for wasm32 because the Worker crate's
-# Workers-only code is compiled only there.
 [tasks.lint]
-description = "cargo fmt --check, clippy (native and wasm32, -D warnings) and the auth front's typecheck"
+description = "cargo fmt --check, clippy (-D warnings), the auth typecheck, shellcheck and a kustomize render"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
-  "cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings",
   "cd auth && (test -d node_modules || npm ci) && npm run typecheck",
+  "mise x shellcheck@0.11.0 -- shellcheck deploy/*.sh deploy/k8s/*.sh",
+  "kubectl kustomize deploy/k8s/base >/dev/null",
+]
+
+# ------------------------------------------------------------------------------
+# Build and deploy. Nothing here runs in CI.
+# ------------------------------------------------------------------------------
+[tasks.build-image]
+description = "Static musl binary -> OCI archive in target/oci: mise run build-image -- [--arch arm64|amd64|all] [--tag T] [--import SSH_HOST]"
+run = "deploy/build-image.sh"
+
+[tasks."deploy:k8s"]
+description = "Secret + kustomize apply to $KUBECONFIG, wait for the tunnel and /readyz: mise run deploy:k8s -- [--rotate] [OVERLAY_DIR]"
+run = "deploy/k8s/apply.sh"
+
+# Uses the gitignored auth/wrangler.personal.jsonc, which holds your VPC service id (docs/setup.md).
+[tasks."deploy:auth"]
+description = "Deploy the auth Worker with auth/wrangler.personal.jsonc"
+dir = "auth"
+run = [
+  "test -f wrangler.personal.jsonc || { echo 'auth/wrangler.personal.jsonc is missing (docs/setup.md)' >&2; exit 1; }",
+  "test -d node_modules || npm ci",
+  "npm run deploy",
 ]

@@ -6,9 +6,7 @@
 //! version and their capabilities in each request's `_meta`; those requests also get the
 //! stricter header checks and result fields that revision asks for.
 
-use std::future::Future;
-use std::pin::{Pin, pin};
-use std::task::Poll;
+use std::time::Duration;
 
 use base64::Engine;
 use rmcp::model::{
@@ -18,8 +16,10 @@ use rmcp::model::{
 use serde_json::{Map, Value, json};
 
 use crate::http::{HttpRequest, HttpResponse};
-use crate::storage::{ByteRange, Storage};
-use crate::tools;
+use crate::policy::Policy;
+use crate::scope::Scopes;
+use crate::storage::{ByteRange, Storage, read_capped};
+use crate::tools::{self, Called};
 
 /// Limits and identity. Build with struct-update syntax over [`ServerConfig::default`].
 #[derive(Debug, Clone)]
@@ -34,13 +34,7 @@ pub struct ServerConfig {
     pub max_image_bytes: u64,
     /// Most results `search_files` returns.
     pub search_limit: usize,
-    /// Folders `search_files` doesn't go into, as normalized absolute paths (see
-    /// [`crate::normalize_path`]). A search at or under one is refused; a search above one
-    /// goes around it. Matched against paths as `list_folder` shows them, ignoring case and
-    /// accents like name search. For folders too big for the backend to search in one call,
-    /// which `list_folder` can still browse.
-    pub search_skip: Vec<String>,
-    /// A text file, normalized like `search_skip`, whose first 8 KiB go into the instructions
+    /// A text file, as an absolute path, whose first 8 KiB go into the instructions
     /// so the owner can tell Claude what each folder is for. `None` turns it off; a missing
     /// or unreadable file is left out quietly.
     pub guide_path: Option<String>,
@@ -48,6 +42,12 @@ pub struct ServerConfig {
     /// (server-to-server) are always allowed. The default is [`CLAUDE_ORIGINS`], in case
     /// Claude's requests carry one.
     pub allowed_origins: Vec<String>,
+    /// How long one tool call may take. Past it, tools return what they have and say so.
+    /// Phase 0 measured 200 s passing through Cloudflare; Claude gives up at 240 s.
+    pub deadline: Duration,
+    /// How long `initialize` waits for the guide before answering without it, so a backend
+    /// that doesn't answer can't hold up the handshake.
+    pub guide_timeout: Duration,
 }
 
 /// Claude's web origins, allowed by default.
@@ -68,9 +68,10 @@ impl Default for ServerConfig {
             max_read_bytes: 100_000,
             max_image_bytes: 1536 * 1024,
             search_limit: 50,
-            search_skip: Vec::new(),
             guide_path: Some(DEFAULT_GUIDE_PATH.into()),
             allowed_origins: CLAUDE_ORIGINS.iter().map(|&o| o.to_owned()).collect(),
+            deadline: Duration::from_secs(180),
+            guide_timeout: Duration::from_millis(1500),
         }
     }
 }
@@ -106,8 +107,9 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 /// change with a new deployment.
 const LIST_TTL_MS: u64 = 60 * 60 * 1000;
 
-const INSTRUCTIONS: &str = "Read-only access to the owner's pCloud storage: the whole drive, or \
-one folder of it. Paths start at its root \"/\" (for example \"/Notes/todo.md\"). \
+const INSTRUCTIONS: &str = "Read-only access to the owner's pCloud drive. Paths start at its \
+root \"/\" (for example \"/Notes/todo.md\"). \
+list_folder shows long folders in pages: call again with the cursor it gives. \
 Find a path with search_files or list_folder before reading it. \
 search_files skips folders the owner turned off for search and says so; browse those with \
 list_folder. \
@@ -163,20 +165,6 @@ impl RpcError {
     }
 }
 
-/// `work`'s output, or `None` when `deadline` finishes first. Polls `work` first, so a result
-/// that is ready wins over a deadline that is too.
-async fn before<T>(work: impl Future<Output = T>, deadline: impl Future<Output = ()>) -> Option<T> {
-    let mut work = pin!(work);
-    let mut deadline = pin!(deadline);
-    std::future::poll_fn(|cx| {
-        if let Poll::Ready(out) = work.as_mut().poll(cx) {
-            return Poll::Ready(Some(out));
-        }
-        deadline.as_mut().poll(cx).map(|()| None)
-    })
-    .await
-}
-
 /// The part of the owner's guide that goes into the instructions.
 struct Guide<'a> {
     path: &'a str,
@@ -208,35 +196,24 @@ impl Reply {
     }
 }
 
-/// Makes a future that finishes when the guide read has taken too long.
-type DeadlineFactory = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()>>>>;
-
 pub struct McpServer<S: Storage> {
     storage: S,
     config: ServerConfig,
-    guide_deadline: Option<DeadlineFactory>,
+    policy: Policy,
 }
 
 impl<S: Storage> McpServer<S> {
+    /// A server with nothing hidden; see [`McpServer::with_policy`].
     pub fn new(storage: S, config: ServerConfig) -> Self {
         Self {
             storage,
             config,
-            guide_deadline: None,
+            policy: Policy::default(),
         }
     }
 
-    /// Bounds the read of the owner's guide during `initialize` and `server/discover`: the
-    /// read is given up, and the guide left out, once the future `deadline` makes finishes.
-    /// The core has no timer of its own, so the runtime supplies one (on Workers,
-    /// `|| worker::Delay::from(Duration::from_millis(1500))`). Without it, a backend that
-    /// never answers holds up the handshake.
-    pub fn with_guide_deadline<F, D>(mut self, deadline: F) -> Self
-    where
-        F: Fn() -> D + 'static,
-        D: Future<Output = ()> + 'static,
-    {
-        self.guide_deadline = Some(Box::new(move || Box::pin(deadline())));
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -244,7 +221,16 @@ impl<S: Storage> McpServer<S> {
         &self.storage
     }
 
-    /// Handles one HTTP request to the MCP endpoint. Authentication is the caller's job.
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    /// Handles one HTTP request to the MCP endpoint. Authentication, and setting
+    /// [`HttpRequest::scopes`] from what it proved, is the caller's job.
     pub async fn handle_http(&self, req: HttpRequest) -> HttpResponse {
         // Checked first: a browser page on a foreign origin gets nothing, not even a 405.
         if let Some(origin) = req.header("origin")
@@ -287,15 +273,25 @@ impl<S: Storage> McpServer<S> {
             return to_http(Reply::error(request_id(&msg), err));
         }
 
-        match self.dispatch(msg).await {
+        match self.dispatch(msg, req.scopes).await {
             Some(reply) => to_http(reply),
             None => HttpResponse::empty(202),
         }
     }
 
-    /// Handles one JSON-RPC message; `None` for notifications and responses.
+    /// Handles one JSON-RPC message from a read-only client; `None` for notifications and
+    /// responses.
     pub async fn handle_jsonrpc(&self, msg: serde_json::Value) -> Option<serde_json::Value> {
-        self.dispatch(msg).await.map(|reply| reply.body)
+        self.handle_jsonrpc_with(msg, Scopes::read_only()).await
+    }
+
+    /// Handles one JSON-RPC message from a client granted `scopes`.
+    pub async fn handle_jsonrpc_with(
+        &self,
+        msg: serde_json::Value,
+        scopes: Scopes,
+    ) -> Option<serde_json::Value> {
+        self.dispatch(msg, scopes).await.map(|reply| reply.body)
     }
 
     fn origin_allowed(&self, origin: &str) -> bool {
@@ -308,7 +304,7 @@ impl<S: Storage> McpServer<S> {
         })
     }
 
-    async fn dispatch(&self, msg: Value) -> Option<Reply> {
+    async fn dispatch(&self, msg: Value, scopes: Scopes) -> Option<Reply> {
         let Value::Object(msg) = msg else {
             return Some(Reply::invalid(None, "Expected a JSON-RPC message object"));
         };
@@ -318,7 +314,10 @@ impl<S: Storage> McpServer<S> {
         }
         match (msg.get("method"), msg.get("id")) {
             (Some(Value::String(method)), Some(_)) => match id {
-                Some(id) => Some(self.handle_request(id, method, msg.get("params")).await),
+                Some(id) => Some(
+                    self.handle_request(id, method, msg.get("params"), scopes)
+                        .await,
+                ),
                 None => Some(Reply::invalid(None, "id must be a string or a number")),
             },
             // A notification. None of them (initialized, cancelled, ...) needs anything from
@@ -335,7 +334,13 @@ impl<S: Storage> McpServer<S> {
         }
     }
 
-    async fn handle_request(&self, id: Value, method: &str, params: Option<&Value>) -> Reply {
+    async fn handle_request(
+        &self,
+        id: Value,
+        method: &str,
+        params: Option<&Value>,
+        scopes: Scopes,
+    ) -> Reply {
         let empty = Map::new();
         let params = match params {
             None | Some(Value::Null) => &empty,
@@ -356,8 +361,8 @@ impl<S: Storage> McpServer<S> {
             "initialize" => self.initialize(params).await,
             "ping" => Ok(json!({})),
             "server/discover" => Ok(to_json(&self.discover().await)),
-            "tools/list" => Ok(self.list_tools(era)),
-            "tools/call" => self.call_tool(params).await,
+            "tools/list" => Ok(self.list_tools(era, scopes)),
+            "tools/call" => self.call_tool(params, scopes).await,
             _ => {
                 let err = RpcError::new(
                     ErrorCode::METHOD_NOT_FOUND,
@@ -414,9 +419,10 @@ impl<S: Storage> McpServer<S> {
     /// The fixed instructions, the folders search skips, and the owner's guide if there is one.
     async fn instructions(&self) -> String {
         let mut text = String::from(INSTRUCTIONS);
-        if !self.config.search_skip.is_empty() {
+        let skipped = self.policy.search_skip().paths();
+        if !skipped.is_empty() {
             text.push_str(" Search is turned off under ");
-            text.push_str(&self.config.search_skip.join(", "));
+            text.push_str(&skipped.join(", "));
             text.push('.');
         }
         if let Some(guide) = self.guide().await {
@@ -436,21 +442,24 @@ impl<S: Storage> McpServer<S> {
     }
 
     /// The start of the owner's guide, or `None` when there is none to show. Any failure, or
-    /// the guide deadline passing, means none: the handshake has to work while the backend is
+    /// the guide timeout passing, means none: the handshake has to work while the backend is
     /// down.
     async fn guide(&self) -> Option<Guide<'_>> {
         let path = self.config.guide_path.as_deref()?;
+        let checked = self.policy.check(path).ok()?;
         // One byte more than shown, to tell a cut guide from one that fits exactly.
-        let range = ByteRange {
-            offset: 0,
-            length: MAX_GUIDE_BYTES as u64 + 1,
+        let length = MAX_GUIDE_BYTES as u64 + 1;
+        let read = async {
+            let stream = self
+                .storage
+                .open(&checked, Some(ByteRange { offset: 0, length }))
+                .await?;
+            read_capped(stream, length).await
         };
-        let read = self.storage.read(path, range);
-        let bytes = match &self.guide_deadline {
-            Some(deadline) => before(read, deadline()).await?,
-            None => read.await,
-        }
-        .ok()?;
+        let bytes = tokio::time::timeout(self.config.guide_timeout, read)
+            .await
+            .ok()?
+            .ok()?;
         let cut = bytes.len() > MAX_GUIDE_BYTES;
         let bytes = &bytes[..bytes.len().min(MAX_GUIDE_BYTES)];
         if bytes.contains(&0) {
@@ -476,8 +485,8 @@ impl<S: Storage> McpServer<S> {
         })
     }
 
-    fn list_tools(&self, era: Era) -> Value {
-        let mut result = ListToolsResult::with_all_items(tools::definitions(&self.config));
+    fn list_tools(&self, era: Era, scopes: Scopes) -> Value {
+        let mut result = ListToolsResult::with_all_items(tools::definitions(&self.config, scopes));
         if era == Era::Stateless {
             result = result
                 .with_ttl_ms(LIST_TTL_MS)
@@ -486,7 +495,11 @@ impl<S: Storage> McpServer<S> {
         to_json(&result)
     }
 
-    async fn call_tool(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+    async fn call_tool(
+        &self,
+        params: &Map<String, Value>,
+        scopes: Scopes,
+    ) -> Result<Value, RpcError> {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -501,10 +514,11 @@ impl<S: Storage> McpServer<S> {
                 ));
             }
         };
-        let result = tools::call(&self.storage, &self.config, name, args)
-            .await
-            .ok_or_else(|| RpcError::invalid_params(format!("Unknown tool: {name}")))?;
-        Ok(to_json(&result))
+        let ctx = tools::Ctx::new(&self.storage, &self.config, &self.policy);
+        match tools::call(&ctx, name, args, scopes).await {
+            Called::Done(result) => Ok(to_json(&result)),
+            Called::Unknown => Err(RpcError::invalid_params(format!("Unknown tool: {name}"))),
+        }
     }
 
     fn capabilities(&self) -> ServerCapabilities {

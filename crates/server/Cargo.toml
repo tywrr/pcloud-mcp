@@ -1,0 +1,29 @@
+[package]
+name = "chance-of-files-server"
+description = "The Chance of Files server: MCP over HTTP in front of rclone, for a pod next to cloudflared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "chance-of-files"
+path = "src/main.rs"
+
+[dependencies]
+chance-of-files-core.workspace = true
+chance-of-files-rclone.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_ignored = "0.1.14"
+subtle.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
