@@ -58,7 +58,7 @@ if ! k get secret chance-of-files >/dev/null 2>&1; then
   [ "$(field type)" = pcloud ] || { echo "rclone remote '$remote' is not a pcloud remote" >&2; exit 1; }
   # Read into variables so a missing field stops the script instead of creating an empty key.
   tok=$(field token | tr -d '\n'); host=$(field hostname | tr -d '\n')
-  [ -n "$tok" ] && [ -n "$host" ] || { echo "rclone remote '$remote' has no token or hostname" >&2; exit 1; }
+  if [ -z "$tok" ] || [ -z "$host" ]; then echo "rclone remote '$remote' has no token or hostname" >&2; exit 1; fi
   # `create`, not apply: apply would copy the values into an annotation.
   k create secret generic chance-of-files \
     --from-file=internal-token=<(tr -d '\n' <"$secrets/internal-token") \
@@ -98,4 +98,4 @@ for _ in $(seq 1 15); do
   sleep 2
 done
 echo "readyz: ${ready:-no answer}"
-[ "$n" -ge 4 ] && [ "$ready" = 200 ] || { k logs deploy/chance-of-files -c core --tail=20 >&2; exit 1; }
+if [ "$n" -lt 4 ] || [ "$ready" != 200 ]; then k logs deploy/chance-of-files -c core --tail=20 >&2; exit 1; fi
