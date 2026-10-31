@@ -1,6 +1,6 @@
 # Background
 
-Why pcloud-mcp exists and how its shape was chosen. A decision record, written 2026-10-29.
+Why Chance of Files exists and how its shape was chosen. A decision record, written 2026-10-29.
 
 ## Why build it
 
@@ -10,7 +10,7 @@ Claude reaches outside services through connectors, and Duet (a research preview
 
 pCloud already runs one at `https://mcp.pcloud.com/mcp`. Its tools, as seen on 2026-10-29: `get_user_info`, `list_folder`, `get_file_info`, `get_file_checksum`, `search_files`, `create_folder`, `create_folder_if_not_exists`, `copy_file`, `copy_files`, `copy_folder`, `move_file`, `move_files`, `move_folder`, `rename_file`, `rename_folder`, `upload_file`, `upload_from_url`, `get_upload_progress`, `create_file_public_link`, `create_folder_public_link`, `change_public_link`, `list_public_links`.
 
-That's a good file manager, but **none of them returns a file's contents**, and none deletes. Claude can see that `notes.md` exists but not read it. pcloud-mcp's niche is the missing half: reading text and images, self-hosted, in Rust.
+That's a good file manager, but **none of them returns a file's contents**, and none deletes. Claude can see that `notes.md` exists but not read it. Chance of Files' niche is the missing half: reading text and images, self-hosted, in Rust.
 
 Requirements, in order:
 
@@ -57,7 +57,7 @@ The price is the laptop: it has to be on and awake. The tools don't know any of 
 
 ## Why not rmcp's runtime
 
-[rmcp](https://crates.io/crates/rmcp) 3.8.0, the official Rust SDK, is the natural choice for an MCP server in Rust, but its service runtime and transports need tokio, and tokio's runtime panics on Workers (wasm32 in a JS isolate: no threads, no tokio timers or I/O driver). With `default-features = false`, the `rmcp::model` module (the JSON-RPC and MCP types) builds for `wasm32-unknown-unknown`, and that's all pcloud-mcp uses. The Streamable HTTP endpoint is hand-written in `crates/core`, which is little code in stateless mode: one `POST`, one JSON-RPC message, one JSON response.
+[rmcp](https://crates.io/crates/rmcp) 3.8.0, the official Rust SDK, is the natural choice for an MCP server in Rust, but its service runtime and transports need tokio, and tokio's runtime panics on Workers (wasm32 in a JS isolate: no threads, no tokio timers or I/O driver). With `default-features = false`, the `rmcp::model` module (the JSON-RPC and MCP types) builds for `wasm32-unknown-unknown`, and that's all Chance of Files uses. The Streamable HTTP endpoint is hand-written in `crates/core`, which is little code in stateless mode: one `POST`, one JSON-RPC message, one JSON response.
 
 ## Alternatives considered
 

@@ -1,6 +1,6 @@
 # Development
 
-Working on pcloud-mcp locally: everything runs on your machine against a small sample tree in `fixtures/webdav-root`, with no Cloudflare account and no pCloud. For running it for real, see [setup.md](setup.md); for how the pieces fit, [architecture.md](architecture.md).
+Working on Chance of Files locally: everything runs on your machine against a small sample tree in `fixtures/webdav-root`, with no Cloudflare account and no pCloud. For running it for real, see [setup.md](setup.md); for how the pieces fit, [architecture.md](architecture.md).
 
 ## Tools
 
@@ -19,10 +19,10 @@ Working on pcloud-mcp locally: everything runs on your machine against a small s
 
 | Path | Crate or package | What |
 |---|---|---|
-| `crates/core` | `pcloud-mcp-core` | The MCP endpoint (Streamable HTTP, stateless), JSON-RPC dispatch, the tools, the `Storage` trait. No Workers or WebDAV code, so its tests run natively |
-| `crates/webdav` | `pcloud-mcp-webdav` | `Storage` over WebDAV, generic over the HTTP transport. Parser tests use captured rclone responses in `tests/data` |
-| `crates/worker` | `pcloud-mcp-worker` | The Rust Worker, deployed as `pcloud-mcp-core`: auth check, config, the Workers transport (fetch or the VPC binding) |
-| `auth/` | `pcloud-mcp-auth` (npm) | The TypeScript Worker `pcloud-mcp`: OAuth and the `/mcp` proxy |
+| `crates/core` | `chance-of-files-core` | The MCP endpoint (Streamable HTTP, stateless), JSON-RPC dispatch, the tools, the `Storage` trait. No Workers or WebDAV code, so its tests run natively |
+| `crates/webdav` | `chance-of-files-webdav` | `Storage` over WebDAV, generic over the HTTP transport. Parser tests use captured rclone responses in `tests/data` |
+| `crates/worker` | `chance-of-files-worker` | The Rust Worker, deployed as `chance-of-files-core`: auth check, config, the Workers transport (fetch or the VPC binding) |
+| `auth/` | `chance-of-files-auth` (npm) | The TypeScript Worker `chance-of-files`: OAuth and the `/mcp` proxy |
 | `scripts/` | | `dev-backend.sh` (local rclone), `smoke-test.sh` (MCP Inspector CLI) |
 | `fixtures/webdav-root/` | | The sample tree: text, a non-ASCII name, an image, a binary file, a deep folder |
 | `deploy/systemd/` | | User services for rclone and cloudflared on the laptop |
@@ -142,8 +142,8 @@ Conventions: Rust edition 2024, `cargo fmt`, `cargo clippy --all-targets -- -D w
 claude.ai connects from Anthropic's cloud, so it can't reach `localhost`. Deploy as in [setup.md](setup.md), then watch both Workers while Claude uses the connector:
 
 ```bash
-(cd auth && npx wrangler tail pcloud-mcp)
-(cd crates/worker && wrangler tail pcloud-mcp-core)
+(cd auth && npx wrangler tail chance-of-files)
+(cd crates/worker && wrangler tail chance-of-files-core)
 ```
 
 Claude caches a server's metadata and tool list for about 5 minutes, so a new tool can take that long to appear.

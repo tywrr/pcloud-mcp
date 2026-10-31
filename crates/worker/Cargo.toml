@@ -1,6 +1,6 @@
 [package]
-name = "pcloud-mcp-worker"
-description = "Cloudflare Worker (workers-rs) that serves the pcloud-mcp MCP endpoint"
+name = "chance-of-files-worker"
+description = "Cloudflare Worker (workers-rs) that serves the Chance of Files MCP endpoint"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-pcloud-mcp-core.workspace = true
-pcloud-mcp-webdav.workspace = true
+chance-of-files-core.workspace = true
+chance-of-files-webdav.workspace = true
 subtle.workspace = true
 worker.workspace = true

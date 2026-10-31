@@ -1,4 +1,4 @@
-# Tools and tasks for working on pcloud-mcp. `mise install` once, then `mise run <task>`; `mise tasks`
+# Tools and tasks for working on chance-of-files. `mise install` once, then `mise run <task>`; `mise tasks`
 # lists them. Rust comes from rustup, not mise (see docs/development.md): rustup target add
 # wasm32-unknown-unknown && cargo install worker-build@0.8.7.
 [tools]

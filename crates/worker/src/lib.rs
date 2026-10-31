@@ -1,4 +1,4 @@
-//! The `pcloud-mcp-core` Worker. It sits behind the OAuth front (the `pcloud-mcp` Worker),
+//! The `chance-of-files-core` Worker. It sits behind the OAuth front (the `chance-of-files` Worker),
 //! which reaches it only through a service binding, and serves:
 //!
 //! - `POST /mcp` (and the 405s for other methods), guarded by the internal bearer token;
@@ -14,8 +14,8 @@ mod settings;
 
 use std::time::Duration;
 
-use pcloud_mcp_core::{HttpRequest, HttpResponse, McpServer};
-use pcloud_mcp_webdav::WebDavStorage;
+use chance_of_files_core::{HttpRequest, HttpResponse, McpServer};
+use chance_of_files_webdav::WebDavStorage;
 use subtle::ConstantTimeEq;
 use worker::{
     Context, Delay, Env, Headers, Request, Response, ResponseBody, Result, console_error,

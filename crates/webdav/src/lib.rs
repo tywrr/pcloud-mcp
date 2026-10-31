@@ -1,4 +1,4 @@
-//! A [`pcloud_mcp_core::Storage`] backed by a WebDAV server (in practice `rclone serve webdav`
+//! A [`chance_of_files_core::Storage`] backed by a WebDAV server (in practice `rclone serve webdav`
 //! over the pCloud Drive mount). HTTP goes through the [`Transport`] trait: `worker::Fetch` or
 //! a Workers VPC binding on Workers, a blocking client in native tests.
 //!
@@ -14,7 +14,7 @@ use std::fmt;
 use std::ops::ControlFlow;
 
 use base64::Engine as _;
-use pcloud_mcp_core::{ByteRange, Entry, NameMatcher, Storage, StorageError};
+use chance_of_files_core::{ByteRange, Entry, NameMatcher, Storage, StorageError};
 
 use crate::multistatus::parse_multistatus;
 use crate::paths::{encode_path, is_direct_child};
@@ -1093,7 +1093,7 @@ mod tests {
 
     #[test]
     fn search_matches_names_exactly_as_the_core_does() {
-        // search_files matches names it lists itself with pcloud_mcp_core::name_matches, so a
+        // search_files matches names it lists itself with chance_of_files_core::name_matches, so a
         // search split around a turned-off folder must agree with this backend's search.
         let hrefs = [
             "/Cafe%CC%81%20menu.txt",
@@ -1132,7 +1132,7 @@ mod tests {
                 .collect();
             let mut core: Vec<String> = names
                 .iter()
-                .filter(|name| pcloud_mcp_core::name_matches(query, name))
+                .filter(|name| chance_of_files_core::name_matches(query, name))
                 .cloned()
                 .collect();
             backend.sort();

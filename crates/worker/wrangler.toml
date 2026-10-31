@@ -1,7 +1,7 @@
-# The Rust half of pcloud-mcp: the MCP endpoint itself. It is never reachable from the
-# internet (no workers.dev URL, no preview URLs, no routes). The OAuth front, the "pcloud-mcp"
+# The Rust half of Chance of Files: the MCP endpoint itself. It is never reachable from the
+# internet (no workers.dev URL, no preview URLs, no routes). The OAuth front, the "chance-of-files"
 # Worker in auth/, calls it through a service binding and adds the internal token.
-name = "pcloud-mcp-core"
+name = "chance-of-files-core"
 # worker-build 0.8 writes a bundled ES module here (build/worker/shim.mjs is only a
 # backwards-compatible alias for it).
 main = "build/index.js"

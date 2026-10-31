@@ -9,7 +9,7 @@ The big one: read pCloud directly from the Worker, so the laptop, the tunnel and
 - **Waiting on**: pCloud approving an OAuth app for this project (requested; app registration is manual since password sign-in was removed in April 2026). See [background.md](background.md#pcloud-api-facts-and-gotchas).
 - **Shape**: a new crate implementing `Storage` (`list` → `listfolder`, `stat` → `stat`, `read` → `getfilelink` plus a ranged `GET` from the Worker itself, `search` → `search` or a bounded walk), chosen by config in the core Worker. The tools don't change.
 - **Auth**: the auth front grows a second leg: after the passphrase, it sends the owner through pCloud's OAuth once and stores the pCloud token (encrypted, in KV), with the client secret as a Worker secret. US and EU API hosts both supported.
-- **`pcloud-sdk` crate**: the pCloud client itself (auth, the methods above, typed errors, both API hosts), runtime-neutral like `pcloud-mcp-webdav` (generic over the HTTP transport), so it's useful outside this project. The name `pcloud-sdk` is free on crates.io as of 2026-10-29.
+- **`pcloud-sdk` crate**: the pCloud client itself (auth, the methods above, typed errors, both API hosts), runtime-neutral like `chance-of-files-webdav` (generic over the HTTP transport), so it's useful outside this project. The name `pcloud-sdk` is free on crates.io as of 2026-10-29.
 - **Keep WebDAV**: the WebDAV backend stays for anyone who would rather serve a local folder, a NAS, or rclone's `pcloud:` remote.
 
 ## Write tools, behind a flag

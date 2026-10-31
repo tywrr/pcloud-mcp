@@ -4,7 +4,7 @@ import { createExecutionContext } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import worker from "../src/index";
 
-export const ORIGIN = "https://pcloud-mcp.example.com";
+export const ORIGIN = "https://chance-of-files.example.com";
 export const RESOURCE = `${ORIGIN}/mcp`;
 export const CLAUDE_CALLBACK = "https://claude.ai/api/mcp/auth_callback";
 export const PASSPHRASE = "test-owner-passphrase";

@@ -8,7 +8,7 @@
 
 use std::ops::ControlFlow;
 
-use pcloud_mcp_core::Entry;
+use chance_of_files_core::Entry;
 use quick_xml::NsReader;
 use quick_xml::events::Event;
 use quick_xml::name::{Namespace, QName, ResolveResult};

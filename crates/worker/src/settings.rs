@@ -1,8 +1,8 @@
 //! Configuration from Worker vars and secrets. Parsing takes a lookup function rather than
 //! `worker::Env`, so it can be tested natively.
 
-use pcloud_mcp_core::{DEFAULT_GUIDE_PATH, ServerConfig, normalize_path};
-use pcloud_mcp_webdav::DEFAULT_MAX_LISTING_BYTES;
+use chance_of_files_core::{DEFAULT_GUIDE_PATH, ServerConfig, normalize_path};
+use chance_of_files_webdav::DEFAULT_MAX_LISTING_BYTES;
 
 /// Everything the `/mcp` handler needs besides the backend binding.
 #[derive(Debug, Clone)]

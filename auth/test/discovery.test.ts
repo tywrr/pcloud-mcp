@@ -42,7 +42,7 @@ describe("discovery", () => {
 				authorization_servers: [ORIGIN],
 				scopes_supported: ["files:read"],
 				bearer_methods_supported: ["header"],
-				resource_name: "pCloud files (pcloud-mcp)",
+				resource_name: "pCloud files (Chance of Files)",
 			});
 		},
 	);

@@ -3,7 +3,7 @@
 //! both are there: it only ever lives in `.dev.vars`, so the binding can stay in
 //! wrangler.toml during local work.
 
-use pcloud_mcp_webdav::{Transport, TransportRequest, TransportResponse};
+use chance_of_files_webdav::{Transport, TransportRequest, TransportResponse};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
 use worker::{Env, Fetch, Fetcher, ResponseBody, js_sys, web_sys};

@@ -63,6 +63,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "chance-of-files-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "icu_normalizer",
+ "pollster",
+ "rmcp",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "chance-of-files-webdav"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chance-of-files-core",
+ "httpdate",
+ "percent-encoding",
+ "pollster",
+ "quick-xml",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "chance-of-files-worker"
+version = "0.1.0"
+dependencies = [
+ "chance-of-files-core",
+ "chance-of-files-webdav",
+ "subtle",
+ "worker",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -447,42 +483,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "pcloud-mcp-core"
-version = "0.1.0"
-dependencies = [
- "base64",
- "icu_normalizer",
- "pollster",
- "rmcp",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pcloud-mcp-webdav"
-version = "0.1.0"
-dependencies = [
- "base64",
- "httpdate",
- "pcloud-mcp-core",
- "percent-encoding",
- "pollster",
- "quick-xml",
- "serde_json",
- "ureq",
-]
-
-[[package]]
-name = "pcloud-mcp-worker"
-version = "0.1.0"
-dependencies = [
- "pcloud-mcp-core",
- "pcloud-mcp-webdav",
- "subtle",
- "worker",
-]
 
 [[package]]
 name = "percent-encoding"

@@ -63,7 +63,7 @@ const MAX_GUIDE_BYTES: usize = 8 * 1024;
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            name: "pcloud-mcp".into(),
+            name: "chance-of-files".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             max_read_bytes: 100_000,
             max_image_bytes: 1536 * 1024,

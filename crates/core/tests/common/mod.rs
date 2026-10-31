@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use pcloud_mcp_core::{
+use chance_of_files_core::{
     ByteRange, Entry, HttpRequest, HttpResponse, McpServer, ServerConfig, Storage, StorageError,
     name_matches,
 };

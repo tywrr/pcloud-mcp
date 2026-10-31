@@ -6,11 +6,11 @@ members = ["crates/core", "crates/webdav", "crates/worker"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tywrr/pcloud-mcp"
+repository = "https://github.com/tywrr/chance-of-files"
 
 [workspace.dependencies]
-pcloud-mcp-core = { path = "crates/core" }
-pcloud-mcp-webdav = { path = "crates/webdav" }
+chance-of-files-core = { path = "crates/core" }
+chance-of-files-webdav = { path = "crates/webdav" }
 
 base64 = "0.23.1"
 percent-encoding = "2.3.2"

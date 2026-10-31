@@ -1,6 +1,6 @@
-# pcloud-mcp auth front
+# Chance of Files auth front
 
-The public half of pcloud-mcp: a TypeScript Worker named `pcloud-mcp` that Claude connects to. It is an OAuth 2.1 authorization server for one person, the owner, built on [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) 1.2.4. Requests to `/mcp` that carry a valid access token are forwarded to the Rust Worker `pcloud-mcp-core` over the `MCP_CORE` service binding, with Claude's token replaced by the shared `INTERNAL_TOKEN`. The core has no public URL.
+The public half of Chance of Files: a TypeScript Worker named `chance-of-files` that Claude connects to. It is an OAuth 2.1 authorization server for one person, the owner, built on [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) 1.2.4. Requests to `/mcp` that carry a valid access token are forwarded to the Rust Worker `chance-of-files-core` over the `MCP_CORE` service binding, with Claude's token replaced by the shared `INTERNAL_TOKEN`. The core has no public URL.
 
 | Path | What it does |
 |---|---|
@@ -32,11 +32,11 @@ Everything else is `404`.
 |---|---|---|
 | `INTERNAL_TOKEN` | secret | Same value as the core's `INTERNAL_TOKEN` |
 | `OWNER_PASSPHRASE` | secret | The sign-in passphrase (12+ characters) |
-| `PUBLIC_URL` | var | Public origin, for example `https://pcloud-mcp.example.workers.dev`. Empty (default) uses the origin each request arrives on. When set, requests on any other hostname get `421` |
+| `PUBLIC_URL` | var | Public origin, for example `https://chance-of-files.example.workers.dev`. Empty (default) uses the origin each request arrives on. When set, requests on any other hostname get `421` |
 | `ALLOWED_REDIRECT_URIS` | var | Comma-separated exact redirect URIs, plus `loopback` for the loopback rule. Empty means the defaults |
 | `DCR_ALLOWED_CIDRS` | var | Who may call `POST /register`: comma-separated IPv4 or IPv6 CIDRs (a bare address is one host), matched against `CF-Connecting-IP`, or `*` for everyone. Empty means the default, `127.0.0.0/8,::1`. Add `160.79.104.0/21` (Anthropic) only if claude.ai falls back to DCR. Claude Code doesn't need it, since it identifies itself with its own metadata document. A client on your own computer that does use DCR, such as the MCP Inspector, registers from your own address: add it for the moment you connect the client, or use `*` and change it back |
 | `OAUTH_KV` | KV | Clients, grants, tokens. Created on the first deploy |
-| `MCP_CORE` | service | The `pcloud-mcp-core` Worker |
+| `MCP_CORE` | service | The `chance-of-files-core` Worker |
 | `PASSPHRASE_LIMITER`, `SIGNIN_LIMITER` | rate limit | See above; `namespace_id` must be unique in your account |
 
 The `resource` in the protected-resource metadata is `<public origin>/mcp`, and it must equal the URL you enter in Claude exactly, so add the connector as `https://<your worker host>/mcp`.
@@ -67,7 +67,7 @@ Then point the MCP Inspector at `http://localhost:8788/mcp`; its loopback callba
 
 ## Deploy
 
-Deploy `pcloud-mcp-core` first: the service binding needs it to exist. Then, from `auth/`:
+Deploy `chance-of-files-core` first: the service binding needs it to exist. Then, from `auth/`:
 
 ```bash
 npx wrangler login

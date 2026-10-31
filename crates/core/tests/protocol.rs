@@ -2,8 +2,8 @@
 
 mod common;
 
+use chance_of_files_core::{ByteRange, Entry, ServerConfig, StorageError};
 use common::*;
-use pcloud_mcp_core::{ByteRange, Entry, ServerConfig, StorageError};
 use serde_json::{Value, json};
 
 fn initialize(version: &str) -> Value {
@@ -45,7 +45,7 @@ fn initialize_describes_the_server() {
         result["capabilities"],
         json!({"tools": {"listChanged": false}})
     );
-    assert_eq!(result["serverInfo"]["name"], json!("pcloud-mcp"));
+    assert_eq!(result["serverInfo"]["name"], json!("chance-of-files"));
     assert_eq!(
         result["serverInfo"]["version"],
         json!(env!("CARGO_PKG_VERSION"))
@@ -254,7 +254,7 @@ fn tools_call_without_arguments_uses_defaults() {
 
 // --- instructions: turned-off folders and the owner's guide --------------------------------
 
-fn instructions_of(server: &pcloud_mcp_core::McpServer<MemoryStorage>) -> String {
+fn instructions_of(server: &chance_of_files_core::McpServer<MemoryStorage>) -> String {
     let response = rpc(
         server,
         "initialize",
@@ -374,7 +374,7 @@ fn a_long_guide_is_cut_at_8_kib_on_a_character_boundary() {
 /// A backend that never answers a read.
 struct HangingStorage;
 
-impl pcloud_mcp_core::Storage for HangingStorage {
+impl chance_of_files_core::Storage for HangingStorage {
     async fn list(&self, path: &str) -> Result<Vec<Entry>, StorageError> {
         Err(StorageError::NotFound(path.into()))
     }
@@ -391,7 +391,7 @@ impl pcloud_mcp_core::Storage for HangingStorage {
 
 #[test]
 fn a_guide_read_that_hangs_is_given_up_at_the_deadline() {
-    let server = pcloud_mcp_core::McpServer::new(HangingStorage, ServerConfig::default())
+    let server = chance_of_files_core::McpServer::new(HangingStorage, ServerConfig::default())
         .with_guide_deadline(|| std::future::ready(()));
     let params = json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}});
     let response = pollster::block_on(server.handle_jsonrpc(request(1, "initialize", params)))

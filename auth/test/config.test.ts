@@ -22,9 +22,9 @@ describe("PUBLIC_URL", () => {
 	});
 
 	it("answers 421 on another hostname, except /healthz", async () => {
-		const other = await fetchWith({ PUBLIC_URL }, "https://pcloud-mcp.someone.workers.dev/mcp", { method: "POST" });
+		const other = await fetchWith({ PUBLIC_URL }, "https://chance-of-files.someone.workers.dev/mcp", { method: "POST" });
 		expect(other.status).toBe(421);
-		const health = await fetchWith({ PUBLIC_URL }, "https://pcloud-mcp.someone.workers.dev/healthz");
+		const health = await fetchWith({ PUBLIC_URL }, "https://chance-of-files.someone.workers.dev/healthz");
 		expect(health.status).toBe(200);
 	});
 
@@ -60,7 +60,7 @@ describe("ALLOWED_REDIRECT_URIS", () => {
 		const policy = new RedirectPolicy(only);
 		expect(policy.allows("http://localhost:6274/oauth/callback")).toBe(false);
 
-		const response = await fetchWith({ ALLOWED_REDIRECT_URIS: only }, "https://pcloud-mcp.example.com/register", {
+		const response = await fetchWith({ ALLOWED_REDIRECT_URIS: only }, "https://chance-of-files.example.com/register", {
 			method: "POST",
 			headers: { "Content-Type": "application/json", "CF-Connecting-IP": "127.0.0.200" },
 			body: JSON.stringify({ redirect_uris: ["http://localhost:6274/oauth/callback"], token_endpoint_auth_method: "none" }),
@@ -75,7 +75,7 @@ describe("several hostnames without PUBLIC_URL", () => {
 		const second = "https://second.example.org";
 		// A request that reaches the first hostname's default handler, which is where the OAuth
 		// library attaches its helpers to env.
-		await exports.default.fetch("https://pcloud-mcp.example.com/nope");
+		await exports.default.fetch("https://chance-of-files.example.com/nope");
 
 		const registered = await exports.default.fetch(
 			new Request(`${second}/register`, {

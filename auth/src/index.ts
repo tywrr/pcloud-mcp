@@ -1,6 +1,6 @@
-// pcloud-mcp: the OAuth front of the pCloud MCP server.
+// chance-of-files: the OAuth front of Chance of Files, an MCP server for your pCloud.
 //
-//   /mcp                                     protected; forwarded to the pcloud-mcp-core Worker
+//   /mcp                                     protected; forwarded to the chance-of-files-core Worker
 //   /authorize                               the owner's passphrase sign-in page
 //   /token                                   OAuth token endpoint (public and client-secret clients)
 //   /register                                Dynamic Client Registration, from DCR_ALLOWED_CIDRS only
@@ -66,7 +66,7 @@ function build(origin: string, redirectSpec: string | undefined): Built {
 			// Must equal the URL entered in Claude, so it is built from this Worker's own origin.
 			resource: `${origin}${MCP_PATH}`,
 			authorization_servers: [origin],
-			resource_name: "pCloud files (pcloud-mcp)",
+			resource_name: "pCloud files (Chance of Files)",
 		},
 		accessTokenTTL: ACCESS_TOKEN_TTL,
 		refreshTokenTTL: REFRESH_TOKEN_TTL,
@@ -148,7 +148,7 @@ function publicOrigin(env: Env, url: URL): string | Response {
 	if (!configured) return url.origin;
 	const parsed = URL.parse(configured);
 	if (!parsed || parsed.pathname !== "/" || parsed.search || parsed.hash) {
-		return new Response("PUBLIC_URL must be an origin such as https://pcloud-mcp.example.workers.dev\n", {
+		return new Response("PUBLIC_URL must be an origin such as https://chance-of-files.example.workers.dev\n", {
 			status: 500,
 		});
 	}

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pcloud_mcp_core::{ByteRange, Storage, StorageError};
-use pcloud_mcp_webdav::{Transport, TransportRequest, TransportResponse, WebDavStorage};
+use chance_of_files_core::{ByteRange, Storage, StorageError};
+use chance_of_files_webdav::{Transport, TransportRequest, TransportResponse, WebDavStorage};
 
 const USER: &str = "mcp";
 const PASSWORD: &str = "test-password";
@@ -427,7 +427,7 @@ fn unreachable_server_is_a_backend_error() {
 /// The whole MCP path natively: McpServer over WebDavStorage over rclone.
 #[test]
 fn mcp_server_end_to_end() {
-    use pcloud_mcp_core::{HttpRequest, McpServer, ServerConfig};
+    use chance_of_files_core::{HttpRequest, McpServer, ServerConfig};
     use serde_json::{Value, json};
 
     let Some(server) = start_server("mcp") else {
@@ -503,7 +503,7 @@ fn mcp_server_end_to_end() {
 /// through the real WebDAV server.
 #[test]
 fn mcp_search_skip_and_guide() {
-    use pcloud_mcp_core::{McpServer, ServerConfig};
+    use chance_of_files_core::{McpServer, ServerConfig};
     use serde_json::{Value, json};
 
     let Some(server) = start_server("skip") else {

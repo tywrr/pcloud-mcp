@@ -1,13 +1,13 @@
 [package]
-name = "pcloud-mcp-webdav"
-description = "WebDAV storage backend for pcloud-mcp, generic over the HTTP transport so it runs on Workers and natively"
+name = "chance-of-files-webdav"
+description = "WebDAV storage backend for Chance of Files, generic over the HTTP transport so it runs on Workers and natively"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pcloud-mcp-core.workspace = true
+chance-of-files-core.workspace = true
 base64.workspace = true
 httpdate.workspace = true
 percent-encoding.workspace = true

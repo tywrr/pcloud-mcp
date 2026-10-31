@@ -1,5 +1,5 @@
 //! The storage contract the tools are written against. Backends: WebDAV (rclone serving the
-//! pCloud Drive mount, `pcloud-mcp-webdav`) today; the pCloud HTTP API once an app is approved.
+//! pCloud Drive mount, `chance-of-files-webdav`) today; the pCloud HTTP API once an app is approved.
 
 use std::fmt;
 

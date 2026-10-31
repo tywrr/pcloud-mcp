@@ -9,7 +9,7 @@ export async function forwardToCore(request: Request, env: Env): Promise<Respons
 	// `echo token | wrangler secret put` stores a trailing newline, which fetch rejects in a header.
 	const token = env.INTERNAL_TOKEN?.replace(/[\r\n]+$/, "");
 	if (!token) {
-		return new Response("INTERNAL_TOKEN is not set on the pcloud-mcp Worker.\n", { status: 500 });
+		return new Response("INTERNAL_TOKEN is not set on the chance-of-files Worker.\n", { status: 500 });
 	}
 	const headers = new Headers(request.headers);
 	headers.set("Authorization", `Bearer ${token}`);
@@ -26,6 +26,6 @@ export async function forwardToCore(request: Request, env: Env): Promise<Respons
 	} catch (error) {
 		// Typically the core isn't deployed yet, or isn't running in local dev.
 		console.error(`MCP_CORE fetch failed: ${error instanceof Error ? error.message : String(error)}`);
-		return new Response("The pcloud-mcp-core Worker could not be reached.\n", { status: 502 });
+		return new Response("The chance-of-files-core Worker could not be reached.\n", { status: 502 });
 	}
 }

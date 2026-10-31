@@ -1,4 +1,4 @@
-//! MCP server logic for pcloud-mcp: the Streamable HTTP endpoint, JSON-RPC dispatch and the
+//! MCP server logic for Chance of Files: the Streamable HTTP endpoint, JSON-RPC dispatch and the
 //! file tools. It knows nothing about Workers or WebDAV; callers supply a [`Storage`] and turn
 //! their runtime's HTTP types into [`HttpRequest`] / [`HttpResponse`].
 

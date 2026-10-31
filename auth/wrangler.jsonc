@@ -1,8 +1,8 @@
-// pcloud-mcp: the public OAuth front of the pCloud MCP server.
+// chance-of-files: the public OAuth front of Chance of Files, an MCP server for your pCloud.
 //
 // It is the URL you add to Claude as a custom connector (https://<this Worker>/mcp). It signs
 // Claude in (OAuth 2.1 with PKCE, Client ID Metadata Documents or Dynamic Client Registration),
-// and forwards authorized /mcp requests to the Rust Worker "pcloud-mcp-core" over a service
+// and forwards authorized /mcp requests to the Rust Worker "chance-of-files-core" over a service
 // binding, which has no public URL of its own.
 //
 // Secrets (set with `npx wrangler secret put NAME`, never in this file; locally in .dev.vars):
@@ -12,7 +12,7 @@
 //                     the output of `openssl rand -base64 24`; anyone who knows it can connect.
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "pcloud-mcp",
+	"name": "chance-of-files",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-10-23",
 	// Client ID Metadata Documents make this Worker fetch a URL the client names. The flag keeps
@@ -25,7 +25,7 @@
 	"observability": { "enabled": true },
 	"vars": {
 		// The public origin of this Worker, without a trailing slash, for example
-		// "https://pcloud-mcp.example.workers.dev". The protected resource ("<PUBLIC_URL>/mcp")
+		// "https://chance-of-files.example.workers.dev". The protected resource ("<PUBLIC_URL>/mcp")
 		// must equal the URL you enter in Claude exactly. Leave it empty to use the origin each
 		// request arrives on, which is right unless the Worker answers on several hostnames.
 		"PUBLIC_URL": "",
@@ -52,7 +52,7 @@
 	"kv_namespaces": [{ "binding": "OAUTH_KV" }],
 	"services": [
 		// The Rust Worker that serves the MCP tools. It must be deployed first.
-		{ "binding": "MCP_CORE", "service": "pcloud-mcp-core" }
+		{ "binding": "MCP_CORE", "service": "chance-of-files-core" }
 	],
 	// Approximate per-IP limits (an IPv6 caller's whole /64 counts as one address), counted
 	// separately in each Cloudflare location. They slow down passphrase guessing and floods; a

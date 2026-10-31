@@ -1,39 +1,39 @@
 # Serves a folder of the pCloud Drive mount, or all of it, read-only over WebDAV on 127.0.0.1:8080,
-# where the Cloudflare Tunnel (pcloud-mcp-tunnel.service) picks it up. Nothing else can reach it.
+# where the Cloudflare Tunnel (chance-of-files-tunnel.service) picks it up. Nothing else can reach it.
 # The local development backend (scripts/dev-backend.sh) uses 8081, so the two can run side by side.
 #
 # Install (docs/setup.md, step 3):
-#   cp deploy/systemd/pcloud-mcp-*.service ~/.config/systemd/user/
+#   cp deploy/systemd/chance-of-files-*.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now pcloud-mcp-webdav
+#   systemctl --user enable --now chance-of-files-webdav
 #
-# ~/.config/pcloud-mcp/webdav.env (mode 600) holds:
+# ~/.config/chance-of-files/webdav.env (mode 600) holds:
 #   RCLONE_USER=mcp                                      Basic auth user; the core Worker's BACKEND_USER
 #   RCLONE_PASS=<openssl rand -hex 24>                   Basic auth password; its BACKEND_PASSWORD secret
-#   PCLOUD_MCP_DIR=/home/you/pCloudDrive/Library         the folder Claude may read (absolute path)
-# and, to serve the whole drive (PCLOUD_MCP_DIR=/home/you/pCloudDrive) without the Crypto Folder:
-#   RCLONE_FILTER_FROM=/home/you/.config/pcloud-mcp/rclone-filter.txt   what to hide, from
+#   CHANCE_OF_FILES_DIR=/home/you/pCloudDrive/Library    the folder Claude may read (absolute path)
+# and, to serve the whole drive (CHANCE_OF_FILES_DIR=/home/you/pCloudDrive) without the Crypto Folder:
+#   RCLONE_FILTER_FROM=/home/you/.config/chance-of-files/rclone-filter.txt   what to hide, from
 #                                                        deploy/rclone-filter.txt (docs/setup.md,
 #                                                        "Serving the whole drive")
 # rclone reads RCLONE_USER, RCLONE_PASS and RCLONE_FILTER_FROM itself (any flag can come from an
 # RCLONE_* variable), so the password never shows up in `ps` and the filter needs no flag here.
 
 [Unit]
-Description=pcloud-mcp: read-only WebDAV over a pCloud Drive folder
-Documentation=https://github.com/tywrr/pcloud-mcp/blob/main/docs/setup.md
+Description=chance-of-files: read-only WebDAV over a pCloud Drive folder
+Documentation=https://github.com/tywrr/chance-of-files/blob/main/docs/setup.md
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/pcloud-mcp/webdav.env
+EnvironmentFile=%h/.config/chance-of-files/webdav.env
 # pCloud Drive mounts ~/pCloudDrive only while its app runs. Until then the folder doesn't exist,
 # so fail and retry rather than serve an empty directory.
-ExecStartPre=/usr/bin/test -d ${PCLOUD_MCP_DIR}
+ExecStartPre=/usr/bin/test -d ${CHANCE_OF_FILES_DIR}
 # /usr/bin/rclone is pacman's (docs/setup.md, step 1). For mise's, use its shim instead,
 # %h/.local/share/mise/shims/rclone, which keeps working across upgrades: the path `mise which
 # rclone` prints (as does `command -v rclone` with mise active) has the version in it, so it breaks
 # on the next upgrade. --dir-cache-time 1m: new files show up in listings and search within a
 # minute (the default is 5m).
-ExecStart=/usr/bin/rclone serve webdav ${PCLOUD_MCP_DIR} --addr 127.0.0.1:8080 --read-only --dir-cache-time 1m
+ExecStart=/usr/bin/rclone serve webdav ${CHANCE_OF_FILES_DIR} --addr 127.0.0.1:8080 --read-only --dir-cache-time 1m
 Restart=on-failure
 RestartSec=30
 NoNewPrivileges=yes

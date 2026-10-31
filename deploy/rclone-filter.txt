@@ -2,9 +2,9 @@
 # files and folders are gone from listings, searches and reads alike. Install it next to
 # webdav.env and point rclone at it there (docs/setup.md, "Serving the whole drive"):
 #
-#   cp deploy/rclone-filter.txt ~/.config/pcloud-mcp/rclone-filter.txt
-#   echo "RCLONE_FILTER_FROM=$HOME/.config/pcloud-mcp/rclone-filter.txt" >> ~/.config/pcloud-mcp/webdav.env
-#   systemctl --user restart pcloud-mcp-webdav
+#   cp deploy/rclone-filter.txt ~/.config/chance-of-files/rclone-filter.txt
+#   echo "RCLONE_FILTER_FROM=$HOME/.config/chance-of-files/rclone-filter.txt" >> ~/.config/chance-of-files/webdav.env
+#   systemctl --user restart chance-of-files-webdav
 #
 # One rule per line. "- pattern" hides what matches. A pattern that starts with "/" is anchored
 # at the root of the served folder; one without matches a name in any folder. "/**" at the end

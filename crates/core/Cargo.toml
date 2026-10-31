@@ -1,6 +1,6 @@
 [package]
-name = "pcloud-mcp-core"
-description = "MCP (Model Context Protocol) server logic and file tools for pcloud-mcp, independent of the storage backend and runtime"
+name = "chance-of-files-core"
+description = "MCP (Model Context Protocol) server logic and file tools for Chance of Files, independent of the storage backend and runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

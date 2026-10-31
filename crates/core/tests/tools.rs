@@ -3,11 +3,11 @@
 mod common;
 
 use base64::Engine;
+use chance_of_files_core::ServerConfig;
 use common::*;
-use pcloud_mcp_core::ServerConfig;
 use serde_json::json;
 
-fn sample() -> pcloud_mcp_core::McpServer<MemoryStorage> {
+fn sample() -> chance_of_files_core::McpServer<MemoryStorage> {
     server(sample_storage())
 }
 
@@ -661,7 +661,7 @@ fn search_goes_around_a_turned_off_folder() {
 }
 
 /// The storage calls since the last time this was asked.
-fn server_storage_calls(server: &pcloud_mcp_core::McpServer<MemoryStorage>) -> Vec<String> {
+fn server_storage_calls(server: &chance_of_files_core::McpServer<MemoryStorage>) -> Vec<String> {
     server.storage().take_calls()
 }
 

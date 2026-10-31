@@ -1,22 +1,22 @@
 # Architecture
 
-How pcloud-mcp is put together, and why. For running it, see [setup.md](setup.md); for working on it, [development.md](development.md).
+How Chance of Files is put together, and why. For running it, see [setup.md](setup.md); for working on it, [development.md](development.md).
 
 ## Components
 
 | Component | Runs on | Code | Job |
 |---|---|---|---|
-| `pcloud-mcp` (auth front) | Cloudflare Worker, public | `auth/`, TypeScript, [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) 1.2.4 | OAuth 2.1 authorization server (PKCE, Client ID Metadata Documents, Dynamic Client Registration) and protected resource for `/mcp`; forwards authorized requests to the core |
-| `pcloud-mcp-core` (core) | Cloudflare Worker, no public URL | `crates/worker`, Rust, [workers-rs](https://github.com/cloudflare/workers-rs) 0.8.7 | Checks `INTERNAL_TOKEN`, reads its config, builds the WebDAV storage and hands the request to the MCP server |
-| `pcloud-mcp-core` crate | (library) | `crates/core` | MCP Streamable HTTP endpoint, JSON-RPC dispatch, the five tools, the `Storage` trait. No Workers or WebDAV code |
-| `pcloud-mcp-webdav` crate | (library) | `crates/webdav` | `Storage` over WebDAV: `PROPFIND` for listings, ranged `GET` for reads. Generic over its HTTP transport, so it runs on Workers and in native tests |
+| `chance-of-files` (auth front) | Cloudflare Worker, public | `auth/`, TypeScript, [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) 1.2.4 | OAuth 2.1 authorization server (PKCE, Client ID Metadata Documents, Dynamic Client Registration) and protected resource for `/mcp`; forwards authorized requests to the core |
+| `chance-of-files-core` (core) | Cloudflare Worker, no public URL | `crates/worker`, Rust, [workers-rs](https://github.com/cloudflare/workers-rs) 0.8.7 | Checks `INTERNAL_TOKEN`, reads its config, builds the WebDAV storage and hands the request to the MCP server |
+| `chance-of-files-core` crate | (library) | `crates/core` | MCP Streamable HTTP endpoint, JSON-RPC dispatch, the five tools, the `Storage` trait. No Workers or WebDAV code |
+| `chance-of-files-webdav` crate | (library) | `crates/webdav` | `Storage` over WebDAV: `PROPFIND` for listings, ranged `GET` for reads. Generic over its HTTP transport, so it runs on Workers and in native tests |
 | `OAUTH_KV` | Workers KV | | OAuth clients, grants and token hashes |
 | Cloudflare Tunnel + Workers VPC service | Cloudflare | | A private path from the core to `127.0.0.1:8080` on the laptop; no public hostname |
-| `cloudflared` | Laptop, `systemd --user` | `deploy/systemd/pcloud-mcp-tunnel.service` | The tunnel's connector; dials out over QUIC |
-| `rclone serve webdav` | Laptop, `systemd --user` | `deploy/systemd/pcloud-mcp-webdav.service`, `deploy/rclone-filter.txt` | Serves one folder of the mount, or all of it minus what the filter file hides, read-only on `127.0.0.1:8080`, with Basic auth |
+| `cloudflared` | Laptop, `systemd --user` | `deploy/systemd/chance-of-files-tunnel.service` | The tunnel's connector; dials out over QUIC |
+| `rclone serve webdav` | Laptop, `systemd --user` | `deploy/systemd/chance-of-files-webdav.service`, `deploy/rclone-filter.txt` | Serves one folder of the mount, or all of it minus what the filter file hides, read-only on `127.0.0.1:8080`, with Basic auth |
 | pCloud Drive | Laptop | pCloud's app | FUSE mount at `~/pCloudDrive`; fetches contents from pCloud on demand and caches them |
 
-The Worker names are fixed in the code and config: the auth front's service binding points at `pcloud-mcp-core` by name.
+The Worker names are fixed in the code and config: the auth front's service binding points at `chance-of-files-core` by name.
 
 ## Request flow
 
@@ -26,9 +26,9 @@ A `read_text_file` call from claude.ai, once the connector is signed in:
 sequenceDiagram
   autonumber
   participant C as Claude (Anthropic cloud)
-  participant A as pcloud-mcp (auth)
+  participant A as chance-of-files (auth)
   participant K as OAUTH_KV
-  participant M as pcloud-mcp-core
+  participant M as chance-of-files-core
   participant T as Tunnel + cloudflared
   participant R as rclone (laptop)
   C->>A: POST /mcp, Authorization: Bearer (access token)
@@ -58,7 +58,7 @@ Each hop has its own credential, so a leak at one layer doesn't open the others.
 | Hop | Who can call | Credential | Where it's checked |
 |---|---|---|---|
 | Internet → auth front | Anyone can reach it; only you can sign in | OAuth access token for `<public URL>/mcp`, issued after the passphrase | `workers-oauth-provider` in `auth/` |
-| Auth front → core | Only Workers with a service binding to `pcloud-mcp-core` in your account | `INTERNAL_TOKEN` (Wrangler secret on both Workers) | Core, constant-time compare; otherwise `401` |
+| Auth front → core | Only Workers with a service binding to `chance-of-files-core` in your account | `INTERNAL_TOKEN` (Wrangler secret on both Workers) | Core, constant-time compare; otherwise `401` |
 | Core → laptop | Only Workers bound to the VPC service | Workers VPC binding (private; the tunnel has no public hostname) | Cloudflare |
 | Tunnel → rclone | Processes on the laptop (loopback only) | HTTP Basic auth, `BACKEND_USER` / `BACKEND_PASSWORD` = `RCLONE_USER` / `RCLONE_PASS` | rclone |
 | rclone → files | | `--read-only`, one subfolder of the mount | rclone, and the folder you chose |
@@ -112,7 +112,7 @@ The tools see only this (in `crates/core/src/storage.rs`). Paths are normalized 
 | `read` | `GET` with `Range` | `getfilelink`, then a ranged `GET` by the Worker itself (links are tied to the requesting IP, so they can't be handed to Claude) |
 | `search` | one `PROPFIND` with `Depth: infinity`, names matched in the Worker; if the server refuses infinite depth, a breadth-first walk of `Depth: 1` listings capped at 40 requests | `search` (undocumented) or a `listfolder` walk |
 
-Names are matched by `pcloud_mcp_core::name_matches` (case- and accent-insensitive), in the backend and in the core alike: `search_files` matches names itself when it splits a search around a `SEARCH_SKIP` folder. It refuses a search at or inside one; above one, it lists each folder on the way down (`list`), matches those names, and calls `search` on every other subfolder, at most 40 calls in all. A subfolder that fails is noted in the result rather than failing the call.
+Names are matched by `chance_of_files_core::name_matches` (case- and accent-insensitive), in the backend and in the core alike: `search_files` matches names itself when it splits a search around a `SEARCH_SKIP` folder. It refuses a search at or inside one; above one, it lists each folder on the way down (`list`), matches those names, and calls `search` on every other subfolder, at most 40 calls in all. A subfolder that fails is noted in the result rather than failing the call.
 
 Workers has no `PROPFIND` in `worker::Method`, so the Worker builds those requests through `web_sys`. When `BACKEND_URL` is set, requests go there with plain `fetch`; it lives only in `.dev.vars`, which is how local development reaches `scripts/dev-backend.sh` on `127.0.0.1:8081` even with the `[[vpc_services]]` block in place. Deployed, there's no `BACKEND_URL`, and requests go through the VPC binding (`PCLOUD_BACKEND`). With neither, `/mcp` answers `500 server misconfigured: no backend`.
 

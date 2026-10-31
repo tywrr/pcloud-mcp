@@ -2,11 +2,11 @@
 
 mod common;
 
+use chance_of_files_core::{HttpRequest, ServerConfig};
 use common::*;
-use pcloud_mcp_core::{HttpRequest, ServerConfig};
 use serde_json::{Value, json};
 
-fn send(req: HttpRequest) -> pcloud_mcp_core::HttpResponse {
+fn send(req: HttpRequest) -> chance_of_files_core::HttpResponse {
     pollster::block_on(server(sample_storage()).handle_http(req))
 }
 
@@ -14,7 +14,7 @@ fn ping() -> Value {
     request(7, "ping", json!({}))
 }
 
-fn error_code(resp: &pcloud_mcp_core::HttpResponse) -> i64 {
+fn error_code(resp: &chance_of_files_core::HttpResponse) -> i64 {
     body_json(resp)["error"]["code"]
         .as_i64()
         .expect("an error code")
@@ -281,7 +281,7 @@ fn stateless_tools_list_carries_result_type_cache_hints_and_server_info() {
     assert!(result["ttlMs"].as_u64().unwrap() > 0);
     assert_eq!(
         result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-        json!("pcloud-mcp")
+        json!("chance-of-files")
     );
     assert_eq!(result["tools"].as_array().unwrap().len(), 5);
 }
@@ -403,7 +403,7 @@ fn server_discover_lists_versions() {
     assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(false));
     assert_eq!(
         result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-        json!("pcloud-mcp")
+        json!("chance-of-files")
     );
     assert!(
         result["instructions"]

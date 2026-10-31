@@ -1,4 +1,4 @@
-use pcloud_mcp_core::{StorageError, normalize_path};
+use chance_of_files_core::{StorageError, normalize_path};
 
 fn ok(input: &str) -> String {
     normalize_path(input).unwrap_or_else(|e| panic!("{input:?} was rejected: {e}"))

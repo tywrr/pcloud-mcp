@@ -1,22 +1,26 @@
-# pcloud-mcp
+# Chance of Files
+
+*Cloudy, with a chance of files:* your pCloud, raining down into Claude's context.
 
 Let **Claude** read the files in your **pCloud**: text and images, from claude.ai, the Claude apps, Claude Code and **Claude Duet**, through a custom connector you host yourself.
 
-pCloud has an [official MCP server](https://mcp.pcloud.com/mcp), and it's good at organizing files, but none of its tools return what's inside one. pcloud-mcp fills that gap: Claude can list, search and read text files and images in one pCloud folder you choose, or the whole drive. It's read-only for now.
+pCloud has an [official MCP server](https://mcp.pcloud.com/mcp), and it's good at organizing files, but none of its tools return what's inside one. Chance of Files fills that gap: Claude can list, search and read text files and images in one pCloud folder you choose, or the whole drive. It's read-only for now.
 
 It's a remote MCP server on Cloudflare Workers: a Rust Worker with the tools, behind a small TypeScript Worker that handles OAuth. The free plan runs it for a focused folder of up to about a thousand files; see [limitations](#limitations). You add it in claude.ai like any other connector and approve it with a passphrase only you know. Claude Duet uses the connectors on your claude.ai account, so Duet gets it too.
 
+Chance of Files is an independent, self-hosted project. It is not affiliated with, endorsed by or supported by pCloud or Anthropic; "pCloud" and "Claude" are their owners' trademarks, used here only to say what this works with.
+
 ## Status
 
-**Proof of concept**, October 2026. pCloud removed password sign-in from its API in April 2026, and an OAuth app has to be approved by pCloud by hand; this project's request is pending. Until then, pcloud-mcp reads pCloud the long way round, through the [pCloud Drive](https://www.pcloud.com/download-free-online-cloud-file-storage.html) mount on your laptop:
+**Proof of concept**, October 2026. pCloud removed password sign-in from its API in April 2026, and an OAuth app has to be approved by pCloud by hand; this project's request is pending. Until then, Chance of Files reads pCloud the long way round, through the [pCloud Drive](https://www.pcloud.com/download-free-online-cloud-file-storage.html) mount on your laptop:
 
 Claude → two Workers → Cloudflare Tunnel → your laptop → `rclone serve webdav --read-only` → `~/pCloudDrive/<folder>` → pCloud
 
 So the laptop has to be on, awake and running pCloud Drive. A backend that calls the pCloud API directly, with no laptop involved, comes once an app is approved; the tools are written against a storage trait so it drops in. See the [roadmap](docs/roadmap.md).
 
-## pcloud-mcp or pCloud's own MCP server?
+## Chance of Files or pCloud's own MCP server?
 
-| | [pCloud MCP](https://mcp.pcloud.com/mcp) (official) | pcloud-mcp |
+| | [pCloud MCP](https://mcp.pcloud.com/mcp) (official) | Chance of Files |
 |---|---|---|
 | Hosted by | pCloud | You: two Workers on your Cloudflare account, plus your laptop for now |
 | List folders, search names, file info | Yes | Yes |
@@ -47,9 +51,9 @@ Paths are relative to the folder you serve: `/` is its root, and `..` is rejecte
 flowchart LR
   claude["Claude<br/>claude.ai, apps, Duet, Claude Code"]
   subgraph cf["Cloudflare Workers (your account)"]
-    auth["pcloud-mcp<br/>TypeScript: OAuth, /mcp proxy"]
+    auth["chance-of-files<br/>TypeScript: OAuth, /mcp proxy"]
     kv[("OAUTH_KV")]
-    core["pcloud-mcp-core<br/>Rust: MCP tools<br/>no public URL"]
+    core["chance-of-files-core<br/>Rust: MCP tools<br/>no public URL"]
   end
   subgraph laptop["Your laptop"]
     cfd["cloudflared<br/>outbound only"]
@@ -64,7 +68,7 @@ flowchart LR
   cfd --> rclone --> drive --> pcloud
 ```
 
-1. Claude calls `https://pcloud-mcp.<your-subdomain>.workers.dev/mcp` with an OAuth access token. The auth Worker checks it, swaps it for the internal token and forwards the request over a service binding.
+1. Claude calls `https://chance-of-files.<your-subdomain>.workers.dev/mcp` with an OAuth access token. The auth Worker checks it, swaps it for the internal token and forwards the request over a service binding.
 2. The core Worker answers MCP (Streamable HTTP, stateless JSON-RPC) and runs the tool, which reads through the `Storage` trait: here WebDAV `PROPFIND` and ranged `GET`.
 3. Those requests reach your laptop through a Workers VPC binding and a Cloudflare Tunnel that has no public hostname. rclone serves the folder read-only, and pCloud Drive fetches file contents from pCloud on demand.
 
@@ -118,13 +122,15 @@ Rust comes from rustup with the `wasm32-unknown-unknown` target, plus `cargo ins
 
 | Path | What |
 |---|---|
-| `crates/core` | `pcloud-mcp-core`: the MCP endpoint, JSON-RPC and tools over the `Storage` trait; no Workers or WebDAV code, so it tests natively |
-| `crates/webdav` | `pcloud-mcp-webdav`: `Storage` over WebDAV (rclone) |
-| `crates/worker` | `pcloud-mcp-worker`: the Rust Worker, deployed as `pcloud-mcp-core` |
-| `auth/` | The TypeScript Worker `pcloud-mcp`: OAuth and the `/mcp` proxy |
+| `crates/core` | `chance-of-files-core`: the MCP endpoint, JSON-RPC and tools over the `Storage` trait; no Workers or WebDAV code, so it tests natively |
+| `crates/webdav` | `chance-of-files-webdav`: `Storage` over WebDAV (rclone) |
+| `crates/worker` | `chance-of-files-worker`: the Rust Worker, deployed as `chance-of-files-core` |
+| `auth/` | The TypeScript Worker `chance-of-files`: OAuth and the `/mcp` proxy |
 | `scripts/`, `fixtures/` | Local WebDAV backend, smoke test, sample file tree |
 | `deploy/systemd/` | User services for rclone and cloudflared |
 
 ## License
+
+Chance of Files is an independent project, not affiliated with pCloud or Anthropic.
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
