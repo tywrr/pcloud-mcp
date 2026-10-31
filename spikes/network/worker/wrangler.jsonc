@@ -1,0 +1,22 @@
+// chance-of-files-spike: phase 0 network spike (docs/design/v2.md). Forwards everything under a
+// secret key to the spike server in the cluster over the Workers VPC service for the new tunnel
+// "chance-of-files". Free plan, workers.dev only. Delete it when phase 0 is done.
+//
+// Secrets (`npx wrangler secret put NAME`, or `--secrets-file` on the first deploy):
+//   SPIKE_TOKEN  the same value as the pod's SPIKE_TOKEN; added as X-Spike-Token on every request.
+//   SPIKE_KEY    random URL-safe string; requests need the path prefix /<SPIKE_KEY>/ or ?k=<SPIKE_KEY>.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "chance-of-files-spike",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-10-23",
+	"workers_dev": true,
+	"preview_urls": false,
+	"observability": { "enabled": true },
+	"secrets": { "required": ["SPIKE_TOKEN", "SPIKE_KEY"] },
+	"vpc_services": [
+		// From `npx wrangler vpc service create chance-of-files ...` (README.md). Not the live
+		// connector's service (pcloud-laptop): this must point at tunnel chance-of-files.
+		{ "binding": "SPIKE", "service_id": "<SERVICE_ID>", "remote": true }
+	]
+}

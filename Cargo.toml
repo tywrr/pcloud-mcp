@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/webdav", "crates/worker"]
+# Throwaway measurement tools (docs/design/v2.md, phase 0), each its own Cargo project.
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.1.0"

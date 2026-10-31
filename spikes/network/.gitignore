@@ -1,0 +1,7 @@
+target/
+dist/
+*.tar
+worker/node_modules/
+worker/.wrangler/
+worker/.secrets
+worker/wrangler.personal.jsonc

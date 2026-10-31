@@ -1,0 +1,84 @@
+# Phase 0 network spike (docs/design/v2.md): the spike server and cloudflared for the NEW tunnel
+# "chance-of-files", in their own namespace. Nothing here touches namespace pcloud-mcp or the
+# live connector's tunnel. Delete the namespace when phase 0 is done.
+#
+# Both containers share the pod's network, so cloudflared reaches the server at 127.0.0.1:8080,
+# the address the Workers VPC service "chance-of-files" was created with; nothing listens on the
+# pod IP.
+#
+# Secret chance-of-files-spike (created by hand, README.md; never committed) holds:
+#   spike-token   = the spike Worker's SPIKE_TOKEN secret
+#   tunnel-token  the eyJ... token of tunnel chance-of-files
+#
+# Replace <SPIKE_IMAGE> before applying (README.md, "Image"). One replica only: Cloudflare
+# spreads requests across every connector of a tunnel.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chance-of-files-spike
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-spike
+  namespace: chance-of-files-spike
+  labels: { app.kubernetes.io/name: network-spike }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: network-spike }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: network-spike }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: spike
+          image: <SPIKE_IMAGE>
+          # An image imported with `k3s ctr images import` exists only on the node.
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: SPIKE_ADDR, value: "127.0.0.1:8080" }
+            - name: SPIKE_TOKEN
+              valueFrom: { secretKeyRef: { name: chance-of-files-spike, key: spike-token } }
+          resources:
+            # Hashing a 20 GiB blob for /blob/sha256 is CPU-bound for a while; leave CPU unlimited.
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.10.2
+          # --protocol quic: Workers VPC doesn't work over http2, the fallback "auto" would pick.
+          args: [tunnel, --no-autoupdate, --protocol, quic, run]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom: { secretKeyRef: { name: chance-of-files-spike, key: tunnel-token } }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+---
+# Nothing needs to connect to this pod: cloudflared dials out, and the server listens on loopback.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-ingress
+  namespace: chance-of-files-spike
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]

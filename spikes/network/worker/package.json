@@ -1,0 +1,20 @@
+{
+  "name": "chance-of-files-spike-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "typecheck": "wrangler types --strict-vars=false --check && tsc --noEmit",
+    "cf-typegen": "wrangler types --strict-vars=false",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "wrangler": "4.156.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261023.1": true
+  }
+}

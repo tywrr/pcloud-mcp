@@ -1,0 +1,32 @@
+# Phase 0 network spike (docs/design/v2.md): a throwaway server that measures what the path
+# workers.dev -> Worker -> Workers VPC -> Cloudflare Tunnel -> pod can carry. Not a workspace
+# member (the root Cargo.toml excludes spikes/), so it never affects `cargo test --workspace`.
+[package]
+name = "cof-network-spike"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace root, so cargo never looks for a parent one.
+[workspace]
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+bytes = "1.12.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.1"
+subtle = "2.6.1"
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
