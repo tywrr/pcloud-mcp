@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chance_of_files_core::{CLAUDE_ORIGINS, Policy, ServerConfig};
+use chance_of_files_index::{IndexConfig, RootConfig};
 use chance_of_files_rclone::RcloneConfig;
 use serde::Deserialize;
 
@@ -20,6 +21,7 @@ struct File {
     policy: PolicySection,
     guide: GuideSection,
     limits: LimitsSection,
+    index: IndexSection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +50,7 @@ struct RcloneSection {
     url: String,
     user: String,
     remote: String,
+    health_every: String,
 }
 
 impl Default for RcloneSection {
@@ -56,6 +59,48 @@ impl Default for RcloneSection {
             url: "http://127.0.0.1:5572".into(),
             user: "core".into(),
             remote: "pcloud".into(),
+            health_every: "5m".into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct IndexSection {
+    enabled: bool,
+    dir: Option<PathBuf>,
+    roots: Vec<RootSection>,
+    max_removal: f64,
+    hash_min_size: u64,
+    hash_in_background: bool,
+}
+
+impl Default for IndexSection {
+    fn default() -> Self {
+        let defaults = IndexConfig::new("");
+        Self {
+            enabled: true,
+            dir: None,
+            roots: vec![RootSection::default()],
+            max_removal: defaults.max_removal,
+            hash_min_size: defaults.hash_min_size,
+            hash_in_background: defaults.hash_in_background,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RootSection {
+    path: String,
+    every: String,
+}
+
+impl Default for RootSection {
+    fn default() -> Self {
+        Self {
+            path: "/".into(),
+            every: "30m".into(),
         }
     }
 }
@@ -114,6 +159,13 @@ pub struct Settings {
     pub internal_token: String,
     pub max_body_bytes: usize,
     pub state_dir: Option<PathBuf>,
+    /// `None` when turned off, or when there is nowhere to keep it.
+    pub index: Option<IndexConfig>,
+    /// The index is on (`[index].enabled`, the default) but neither `[index].dir` nor
+    /// `[server].state_dir` says where to keep it, so it is off: worth a warning.
+    pub index_needs_dir: bool,
+    /// How often rclone's health is checked while it works.
+    pub health_every: Duration,
     /// Keys in the file this version doesn't know (typos, or newer settings), for the log.
     pub unknown_keys: Vec<String>,
 }
@@ -128,6 +180,8 @@ impl std::fmt::Debug for Settings {
             .field("rclone", &self.rclone)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("state_dir", &self.state_dir)
+            .field("index", &self.index)
+            .field("health_every", &self.health_every)
             .finish_non_exhaustive()
     }
 }
@@ -208,6 +262,14 @@ pub fn parse(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Setting
         }
     }
 
+    let health_every =
+        duration(&file.rclone.health_every).map_err(|e| format!("rclone.health_every: {e}"))?;
+    if health_every < Duration::from_secs(10) {
+        return Err("rclone.health_every must be at least 10s".into());
+    }
+    let index = index_config(&file.index, file.server.state_dir.as_deref())?;
+    let index_needs_dir = file.index.enabled && index.is_none();
+
     let core = ServerConfig {
         max_read_bytes: limits.max_read_bytes,
         max_image_bytes: limits.max_image_bytes,
@@ -232,8 +294,54 @@ pub fn parse(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Setting
         internal_token,
         max_body_bytes: limits.max_body_bytes,
         state_dir: file.server.state_dir,
+        index,
+        index_needs_dir,
+        health_every,
         unknown_keys,
     })
+}
+
+/// The index settings, with `dir` defaulting to `<state_dir>/index`. Roots are checked
+/// against the policy when the index opens.
+fn index_config(
+    section: &IndexSection,
+    state_dir: Option<&Path>,
+) -> Result<Option<IndexConfig>, String> {
+    if !section.enabled {
+        return Ok(None);
+    }
+    let Some(dir) = section
+        .dir
+        .clone()
+        .or_else(|| state_dir.map(|d| d.join("index")))
+    else {
+        return Ok(None);
+    };
+    if !(0.0..=1.0).contains(&section.max_removal) {
+        return Err("index.max_removal must be between 0 and 1 (0.05 is 5%)".into());
+    }
+    if section.roots.is_empty() {
+        return Err("index.roots is empty; list at least one root, such as \"/\"".into());
+    }
+    let mut config = IndexConfig::new(dir);
+    config.max_removal = section.max_removal;
+    config.hash_min_size = section.hash_min_size.max(1);
+    config.hash_in_background = section.hash_in_background;
+    config.roots = section
+        .roots
+        .iter()
+        .map(|root| {
+            let path = chance_of_files_core::normalize_path(&root.path)
+                .map_err(|e| format!("index.roots: {e}"))?;
+            let every =
+                duration(&root.every).map_err(|e| format!("index.roots {path}: every: {e}"))?;
+            if every < Duration::from_secs(60) {
+                return Err(format!("index.roots {path}: every must be at least 1m"));
+            }
+            Ok(RootConfig { path, every })
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(Some(config))
 }
 
 /// `180s`, `5m`, `1h`, `1500ms`; a bare number is seconds.
@@ -252,7 +360,10 @@ pub fn duration(text: &str) -> Result<Duration, String> {
         "" | "s" => Ok(seconds(number)),
         "m" => Ok(seconds(number.saturating_mul(60))),
         "h" => Ok(seconds(number.saturating_mul(3600))),
-        _ => Err(format!("{text:?} has an unknown unit; use ms, s, m or h")),
+        "d" => Ok(seconds(number.saturating_mul(86_400))),
+        _ => Err(format!(
+            "{text:?} has an unknown unit; use ms, s, m, h or d"
+        )),
     }
 }
 
@@ -288,6 +399,17 @@ mod tests {
         let s = parse(example, &env).unwrap();
         assert!(s.unknown_keys.is_empty(), "{:?}", s.unknown_keys);
         assert_eq!(s.core.deadline, Duration::from_secs(180));
+        assert!(s.index.is_none(), "the example sets no directory");
+    }
+
+    #[test]
+    fn the_cluster_config_parses() {
+        let base = include_str!("../../../deploy/k8s/base/config.toml");
+        let s = parse(base, &env).unwrap();
+        assert!(s.unknown_keys.is_empty(), "{:?}", s.unknown_keys);
+        let index = s.index.unwrap();
+        assert_eq!(index.dir, Path::new("/var/lib/chance-of-files/index"));
+        assert_eq!(index.roots[0].path, "/");
     }
 
     #[test]
@@ -332,6 +454,71 @@ mod tests {
     }
 
     #[test]
+    fn index_settings() {
+        let s = parse("", &env).unwrap();
+        assert!(s.index.is_none(), "no state_dir and no index.dir: no index");
+        assert!(s.index_needs_dir, "worth a warning");
+        assert_eq!(s.health_every, Duration::from_secs(300));
+        let off = parse("[index]\nenabled = false", &env).unwrap();
+        assert!(
+            off.index.is_none() && !off.index_needs_dir,
+            "off on purpose"
+        );
+
+        let s = parse("[server]\nstate_dir = \"/var/lib/cof\"", &env).unwrap();
+        let index = s.index.unwrap();
+        assert_eq!(index.dir, Path::new("/var/lib/cof/index"));
+        assert_eq!(index.roots.len(), 1);
+        assert_eq!(index.roots[0].path, "/");
+        assert_eq!(index.roots[0].every, Duration::from_secs(1800));
+
+        let s = parse(
+            r#"
+            [rclone]
+            health_every = "1m"
+            [index]
+            dir = "/data/index"
+            max_removal = 0.1
+            hash_in_background = false
+            [[index.roots]]
+            path = "/"
+            every = "30m"
+            [[index.roots]]
+            path = "Backups/Immich/"
+            every = "6h"
+            "#,
+            &env,
+        )
+        .unwrap();
+        assert!(s.unknown_keys.is_empty(), "{:?}", s.unknown_keys);
+        assert_eq!(s.health_every, Duration::from_secs(60));
+        let index = s.index.unwrap();
+        assert_eq!(index.max_removal, 0.1);
+        assert!(!index.hash_in_background);
+        assert_eq!(index.roots[1].path, "/Backups/Immich");
+        assert_eq!(index.roots[1].every, Duration::from_secs(6 * 3600));
+
+        assert!(
+            parse("[index]\nenabled = false\ndir = \"/x\"", &env)
+                .unwrap()
+                .index
+                .is_none()
+        );
+        for (text, needle) in [
+            ("[index]\ndir = \"/x\"\nmax_removal = 2.0", "max_removal"),
+            ("[index]\ndir = \"/x\"\nroots = []", "index.roots"),
+            (
+                "[index]\ndir = \"/x\"\n[[index.roots]]\npath = \"/\"\nevery = \"10s\"",
+                "at least 1m",
+            ),
+            ("[rclone]\nhealth_every = \"1s\"", "health_every"),
+        ] {
+            let err = parse(text, &env).err().unwrap_or_default();
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
+    #[test]
     fn secrets_are_required() {
         let none = |_: &str| None;
         let err = parse("", &none).unwrap_err();
@@ -366,6 +553,7 @@ mod tests {
         assert_eq!(duration("1500ms"), Ok(Duration::from_millis(1500)));
         assert!(duration("1.5s").is_err());
         assert!(duration("s").is_err());
-        assert!(duration("3d").is_err());
+        assert_eq!(duration("1d"), Ok(Duration::from_secs(86_400)));
+        assert!(duration("3w").is_err());
     }
 }

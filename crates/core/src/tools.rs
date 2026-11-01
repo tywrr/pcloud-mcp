@@ -17,6 +17,9 @@ use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotation
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+use crate::audit;
+use crate::health::Health;
+use crate::index::{Index, Sort};
 use crate::matching::NameMatcher;
 use crate::policy::{CheckedPath, PathSet, Policy};
 use crate::scope::{Scope, Scopes};
@@ -28,15 +31,29 @@ const GET_FILE_INFO: &str = "get_file_info";
 const READ_TEXT_FILE: &str = "read_text_file";
 const READ_IMAGE: &str = "read_image";
 const SEARCH_FILES: &str = "search_files";
+pub(crate) const FOLDER_STATS: &str = "folder_stats";
+pub(crate) const QUERY_FILES: &str = "query_files";
+pub(crate) const FIND_DUPLICATES: &str = "find_duplicates";
+pub(crate) const RECENT_CHANGES: &str = "recent_changes";
+pub(crate) const TYPE_BREAKDOWN: &str = "type_breakdown";
+pub(crate) const INDEX_STATUS: &str = "index_status";
+pub(crate) const REFRESH_INDEX: &str = "refresh_index";
 
-/// Every tool and the scope it needs, in `tools/list` order (2026-07-28 asks for a
-/// deterministic list so clients can cache it).
-const TOOLS: &[(&str, Scope)] = &[
-    (LIST_FOLDER, Scope::Read),
-    (GET_FILE_INFO, Scope::Read),
-    (READ_TEXT_FILE, Scope::Read),
-    (READ_IMAGE, Scope::Read),
-    (SEARCH_FILES, Scope::Read),
+/// Every tool, the scope it needs and whether it needs the index, in `tools/list` order
+/// (2026-07-28 asks for a deterministic list so clients can cache it).
+const TOOLS: &[(&str, Scope, bool)] = &[
+    (LIST_FOLDER, Scope::Read, false),
+    (GET_FILE_INFO, Scope::Read, false),
+    (READ_TEXT_FILE, Scope::Read, false),
+    (READ_IMAGE, Scope::Read, false),
+    (SEARCH_FILES, Scope::Read, false),
+    (FOLDER_STATS, Scope::Read, true),
+    (QUERY_FILES, Scope::Read, true),
+    (FIND_DUPLICATES, Scope::Read, true),
+    (RECENT_CHANGES, Scope::Read, true),
+    (TYPE_BREAKDOWN, Scope::Read, true),
+    (INDEX_STATUS, Scope::Read, true),
+    (REFRESH_INDEX, Scope::Read, true),
 ];
 
 /// Most entries one `list_folder` page shows.
@@ -54,6 +71,8 @@ const WEBP: &str = "image/webp";
 
 /// What a tool returns: its output, or a message for the model.
 type ToolOutput = Result<Vec<ContentBlock>, String>;
+/// Output with optional `structuredContent`, for the audit tools.
+pub(crate) type Structured = Result<(Vec<ContentBlock>, Option<Value>), String>;
 
 /// The outcome of `tools/call`.
 pub(crate) enum Called {
@@ -63,39 +82,96 @@ pub(crate) enum Called {
 
 /// Everything a tool call needs, and when it has to be done by.
 pub(crate) struct Ctx<'a, S> {
-    storage: &'a S,
-    config: &'a ServerConfig,
-    policy: &'a Policy,
-    deadline: Instant,
+    pub(crate) storage: &'a S,
+    pub(crate) config: &'a ServerConfig,
+    pub(crate) policy: &'a Policy,
+    pub(crate) index: Option<&'a Arc<dyn Index>>,
+    pub(crate) health: &'a Health,
+    pub(crate) deadline: Instant,
 }
 
 /// A storage call that didn't finish before the call's deadline.
-struct Late;
+pub(crate) struct Late;
+
+/// How long a live call waits for a re-check of a backend marked unhealthy.
+const RECHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<'a, S: Storage> Ctx<'a, S> {
-    pub(crate) fn new(storage: &'a S, config: &'a ServerConfig, policy: &'a Policy) -> Self {
+    pub(crate) fn new(
+        storage: &'a S,
+        config: &'a ServerConfig,
+        policy: &'a Policy,
+        index: Option<&'a Arc<dyn Index>>,
+        health: &'a Health,
+    ) -> Self {
         Self {
             storage,
             config,
             policy,
+            index,
+            health,
             deadline: Instant::now() + config.deadline,
         }
     }
 
     /// `work`, unless the deadline passes first.
-    async fn within<T>(&self, work: impl Future<Output = T>) -> Result<T, Late> {
+    pub(crate) async fn within<T>(&self, work: impl Future<Output = T>) -> Result<T, Late> {
         tokio::time::timeout_at(self.deadline, work)
             .await
             .map_err(|_| Late)
     }
 
+    /// Lets a live call through unless the backend is known to be failing: then it checks
+    /// once more (a cheap call), so a recovered backend works at once and a dead one fails
+    /// fast instead of using up the call's deadline.
+    pub(crate) async fn gate(&self) -> Result<(), String> {
+        if self.health.is_healthy() {
+            return Ok(());
+        }
+        match tokio::time::timeout(RECHECK_TIMEOUT, self.storage.health()).await {
+            Ok(Ok(())) => {
+                self.health.set_ok();
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                self.health.set_failed(&redact_urls(&err.to_string()));
+                Err(self.unhealthy_message())
+            }
+            Err(_) => {
+                self.health.set_failed("the health check timed out");
+                Err(self.unhealthy_message())
+            }
+        }
+    }
+
+    fn unhealthy_message(&self) -> String {
+        let what = self
+            .health
+            .describe()
+            .unwrap_or_else(|| "backend unhealthy".into());
+        let rest = if self.index.is_some() {
+            " Tools that answer from the index (list_folder, search_files, query_files, \
+             folder_stats and the rest) still work, as of their last walk."
+        } else {
+            " Try again later."
+        };
+        format!("The file server can't be reached right now: {what}.{rest}")
+    }
+
     /// `work` for a tool that can't return a partial answer: past the deadline it fails.
-    async fn timed<T>(
+    pub(crate) async fn timed<T>(
         &self,
         work: impl Future<Output = Result<T, StorageError>>,
     ) -> Result<T, String> {
+        self.gate().await?;
         match self.within(work).await {
-            Ok(result) => result.map_err(storage_error),
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(err)) => {
+                if matches!(err, StorageError::Backend(_) | StorageError::Unhealthy(_)) {
+                    self.health.poke();
+                }
+                Err(storage_error(err))
+            }
             Err(Late) => Err(format!(
                 "The storage backend didn't answer within the {} time limit. Try again later.",
                 seconds(self.config.deadline)
@@ -103,18 +179,24 @@ impl<'a, S: Storage> Ctx<'a, S> {
         }
     }
 
-    fn check(&self, path: &str) -> Result<CheckedPath, String> {
+    pub(crate) fn check(&self, path: &str) -> Result<CheckedPath, String> {
         self.policy.check(path).map_err(storage_error)
     }
 }
 
 /// Tool definitions the client's scopes allow, in a fixed order. Limits in the descriptions
 /// and schemas come from `config`.
-pub(crate) fn definitions(config: &ServerConfig, scopes: Scopes) -> Vec<Tool> {
+pub(crate) fn definitions(config: &ServerConfig, scopes: Scopes, indexed: bool) -> Vec<Tool> {
     TOOLS
         .iter()
-        .filter(|(_, scope)| scopes.contains(*scope))
-        .map(|(name, _)| definition(config, name))
+        .filter(|(_, scope, needs_index)| scopes.contains(*scope) && (indexed || !needs_index))
+        .map(|(name, _, _)| {
+            if indexed {
+                audit::definition(config, name).unwrap_or_else(|| definition(config, name))
+            } else {
+                definition(config, name)
+            }
+        })
         .collect()
 }
 
@@ -140,6 +222,12 @@ fn definition(config: &ServerConfig, name: &str) -> Tool {
                         "description": "Folder to list, e.g. \"/\" or \"/Notes/2026\".",
                         "default": "/"
                     },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["name", "largest", "smallest", "newest", "oldest"],
+                        "default": "name",
+                        "description": "Order of the entries."
+                    },
                     "cursor": {
                         "type": "string",
                         "description": "From the previous page of the same folder, to continue it."
@@ -159,6 +247,11 @@ fn definition(config: &ServerConfig, name: &str) -> Tool {
                     "path": {
                         "type": "string",
                         "description": "File or folder, e.g. \"/Notes/todo.md\"."
+                    },
+                    "hash": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Also fetch the file's content hashes (SHA-1, MD5); slower."
                     }
                 },
                 "required": ["path"],
@@ -258,7 +351,7 @@ fn definition(config: &ServerConfig, name: &str) -> Tool {
     }
 }
 
-fn tool(name: &'static str, title: &str, description: &str, schema: Value) -> Tool {
+pub(crate) fn tool(name: &'static str, title: &str, description: &str, schema: Value) -> Tool {
     let schema: Arc<JsonObject> = Arc::new(object(schema));
     // Every tool so far only reads. The title is repeated in the annotations for 2025-03-26
     // clients, which predate Tool.title.
@@ -279,9 +372,12 @@ pub(crate) async fn call<S: Storage>(
     args: &Map<String, Value>,
     scopes: Scopes,
 ) -> Called {
-    let Some(&(_, scope)) = TOOLS.iter().find(|(tool, _)| *tool == name) else {
+    let Some(&(_, scope, needs_index)) = TOOLS.iter().find(|(tool, _, _)| *tool == name) else {
         return Called::Unknown;
     };
+    if needs_index && ctx.index.is_none() {
+        return Called::Unknown;
+    }
     if !scopes.contains(scope) {
         return Called::Done(CallToolResult::error(vec![ContentBlock::text(format!(
             "{name} needs the {scope} permission, which this connection wasn't granted. The \
@@ -289,16 +385,24 @@ pub(crate) async fn call<S: Storage>(
         ))]));
     }
     let args = Args(args);
+    let plain = |out: ToolOutput| out.map(|content| (content, None));
     let output = match name {
         LIST_FOLDER => list_folder(ctx, &args).await,
-        GET_FILE_INFO => get_file_info(ctx, &args).await,
-        READ_TEXT_FILE => read_text_file(ctx, &args).await,
-        READ_IMAGE => read_image(ctx, &args).await,
+        GET_FILE_INFO => plain(get_file_info(ctx, &args).await),
+        READ_TEXT_FILE => plain(read_text_file(ctx, &args).await),
+        READ_IMAGE => plain(read_image(ctx, &args).await),
         SEARCH_FILES => search_files(ctx, &args).await,
-        _ => return Called::Unknown,
+        name => match audit::call(ctx, name, &args).await {
+            Some(output) => output,
+            None => return Called::Unknown,
+        },
     };
     Called::Done(match output {
-        Ok(content) => CallToolResult::success(content),
+        Ok((content, structured)) => {
+            let mut result = CallToolResult::success(content);
+            result.structured_content = structured;
+            result
+        }
         Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
     })
 }
@@ -308,9 +412,48 @@ fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase(), e.name.clone()));
 }
 
-async fn list_folder<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
+async fn list_folder<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> Structured {
     let path = ctx.check(args.string("path")?.unwrap_or("/"))?;
-    let offset = match args.string("cursor")? {
+    let sort = match args.string("sort")? {
+        None => Sort::Name,
+        Some(s) => audit::parse_sort(
+            s,
+            &[
+                Sort::Name,
+                Sort::Largest,
+                Sort::Smallest,
+                Sort::Newest,
+                Sort::Oldest,
+            ],
+        )?,
+    };
+    if ctx.index.is_some()
+        && !args.bool("live")?.unwrap_or(false)
+        && let Some(done) = audit::list_folder(ctx, &path, sort, args.string("cursor")?).await?
+    {
+        return Ok(done);
+    }
+    let cursor = args.string("cursor")?;
+    if cursor.is_some_and(audit::is_index_cursor) {
+        return Err(
+            "That cursor came from an index listing; repeat the call without live=true, \
+                    or start the live listing again without the cursor."
+                .into(),
+        );
+    }
+    list_folder_live(ctx, &path, sort, cursor)
+        .await
+        .map(|c| (c, None))
+}
+
+async fn list_folder_live<S: Storage>(
+    ctx: &Ctx<'_, S>,
+    path: &CheckedPath,
+    sort: Sort,
+    cursor: Option<&str>,
+) -> ToolOutput {
+    let path = path.clone();
+    let offset = match cursor {
         None | Some("") => 0,
         Some(cursor) => decode_cursor(cursor).ok_or(
             "cursor is not one list_folder gave out; leave it out to start from the first page.",
@@ -319,6 +462,13 @@ async fn list_folder<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutpu
     let mut entries = ctx.timed(ctx.storage.list(&path)).await?;
     entries.retain(|e| ctx.policy.visible(&e.path));
     sort_entries(&mut entries);
+    match sort {
+        Sort::Largest => entries.sort_by_key(|e| std::cmp::Reverse(e.size.unwrap_or(0))),
+        Sort::Smallest => entries.sort_by_key(|e| e.size.unwrap_or(0)),
+        Sort::Newest => entries.sort_by(|a, b| b.modified.cmp(&a.modified)),
+        Sort::Oldest => entries.sort_by(|a, b| a.modified.cmp(&b.modified)),
+        _ => {}
+    }
 
     let total = entries.len();
     if total == 0 {
@@ -359,11 +509,11 @@ async fn list_folder<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutpu
 }
 
 /// Cursors are opaque to the model, so the format can change; today it's the next offset.
-fn encode_cursor(offset: usize) -> String {
+pub(crate) fn encode_cursor(offset: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("o:{offset}"))
 }
 
-fn decode_cursor(cursor: &str) -> Option<usize> {
+pub(crate) fn decode_cursor(cursor: &str) -> Option<usize> {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor.trim())
         .ok()?;
@@ -376,7 +526,19 @@ fn decode_cursor(cursor: &str) -> Option<usize> {
 
 async fn get_file_info<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
     let path = ctx.check(args.required_path("path")?)?;
-    let entry = ctx.timed(ctx.storage.stat(&path, false)).await?;
+    let with_hash = args.bool("hash")?.unwrap_or(false);
+    let entry = match ctx.timed(ctx.storage.stat(&path, with_hash)).await {
+        Ok(entry) => entry,
+        // The index may still know it while the backend is down (not when it is just gone).
+        Err(message) if backend_failed(&message) => {
+            let why = ctx.health.describe().unwrap_or_else(|| message.clone());
+            return match audit::file_info_from_index(ctx, &path, &why).await {
+                Some(text) => Ok(vec![ContentBlock::text(text)]),
+                None => Err(message),
+            };
+        }
+        Err(message) => return Err(message),
+    };
     let mut text = format!("Path: {}\n", entry.path);
     if !entry.name.is_empty() {
         text.push_str(&format!("Name: {}\n", entry.name));
@@ -398,6 +560,15 @@ async fn get_file_info<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOut
     }
     if let Some(content_type) = &entry.content_type {
         text.push_str(&format!("Content type: {content_type}\n"));
+    }
+    for (kind, value) in &entry.hashes {
+        text.push_str(&format!("{}: {value}\n", kind.name().to_uppercase()));
+    }
+    if with_hash && entry.hashes.is_empty() && !entry.is_dir {
+        text.push_str("Hashes: the storage backend reported none for this file.\n");
+    }
+    if ctx.index.is_some() {
+        audit::add_index_info(ctx, &entry, &mut text).await;
     }
     Ok(vec![ContentBlock::text(text)])
 }
@@ -559,7 +730,7 @@ async fn read_image<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput
     ])
 }
 
-async fn search_files<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutput {
+async fn search_files<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> Structured {
     let query = args
         .string("query")?
         .map(str::trim)
@@ -581,6 +752,19 @@ async fn search_files<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutp
              instead."
         ));
     }
+    if ctx.index.is_some()
+        && let Some(done) = audit::search_files(ctx, query, &root, args, limit).await?
+    {
+        return Ok(done);
+    }
+    if args.string("cursor")?.is_some() {
+        return Err(
+            "cursor only works while the index covers the search; repeat the search \
+                    without it."
+                .into(),
+        );
+    }
+    ctx.gate().await?;
     let excludes = ctx.policy.search_excludes();
     let mut search = Search::new(ctx, query, &excludes, limit);
     if excludes.any_below(root.as_str()) {
@@ -615,7 +799,7 @@ async fn search_files<S: Storage>(ctx: &Ctx<'_, S>, args: &Args<'_>) -> ToolOutp
         }
         text.push_str(note);
     }
-    Ok(vec![ContentBlock::text(text)])
+    Ok((vec![ContentBlock::text(text)], None))
 }
 
 /// A name search. Where nothing below a folder is excluded it walks the folder whole; above
@@ -843,7 +1027,7 @@ fn push_entry_lines<'a>(text: &mut String, entries: impl Iterator<Item = &'a Ent
 
 /// `- notes.md (file, 1.2 KiB, modified 2026-10-01T09:00:00Z) path: /Notes/notes.md`, written
 /// straight into `text`: a folder can have a thousand of these.
-fn push_entry_line(text: &mut String, entry: &Entry) {
+pub(crate) fn push_entry_line(text: &mut String, entry: &Entry) {
     let (slash, kind) = if entry.is_dir {
         ("/", "folder")
     } else {
@@ -863,10 +1047,20 @@ fn push_entry_line(text: &mut String, entry: &Entry) {
 
 /// The tool arguments, with lenient readers: `null` counts as absent, and numbers may arrive
 /// as whole floats or numeric strings, which models sometimes send.
-struct Args<'a>(&'a Map<String, Value>);
+pub(crate) struct Args<'a>(pub(crate) &'a Map<String, Value>);
 
 impl Args<'_> {
-    fn string(&self, key: &str) -> Result<Option<&str>, String> {
+    pub(crate) fn bool(&self, key: &str) -> Result<Option<bool>, String> {
+        match self.0.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("true") => Ok(Some(true)),
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("false") => Ok(Some(false)),
+            Some(_) => Err(format!("{key} must be true or false.")),
+        }
+    }
+
+    pub(crate) fn string(&self, key: &str) -> Result<Option<&str>, String> {
         match self.0.get(key) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(s)) => Ok(Some(s)),
@@ -874,7 +1068,7 @@ impl Args<'_> {
         }
     }
 
-    fn uint(&self, key: &str) -> Result<Option<u64>, String> {
+    pub(crate) fn uint(&self, key: &str) -> Result<Option<u64>, String> {
         let invalid = || format!("{key} must be a whole number, 0 or more.");
         match self.0.get(key) {
             None | Some(Value::Null) => Ok(None),
@@ -890,7 +1084,7 @@ impl Args<'_> {
         }
     }
 
-    fn required_path(&self, key: &str) -> Result<&str, String> {
+    pub(crate) fn required_path(&self, key: &str) -> Result<&str, String> {
         self.string(key)?
             .ok_or_else(|| format!("{key} is required, e.g. \"/Notes/todo.md\"."))
     }
@@ -898,7 +1092,7 @@ impl Args<'_> {
 
 /// The error text for the model, with a hint at what to do next. Backend messages are
 /// scrubbed of URLs, which could carry credentials.
-fn storage_error(err: StorageError) -> String {
+pub(crate) fn storage_error(err: StorageError) -> String {
     let hint = match &err {
         StorageError::NotFound(_) => " Check the path with list_folder or search_files.",
         StorageError::NotADirectory(_) => " Use get_file_info or read_text_file for a file.",
@@ -920,14 +1114,26 @@ fn storage_error(err: StorageError) -> String {
     format!("{message}{stop}{hint}")
 }
 
-fn redact_urls(text: &str) -> String {
+/// Whether a tool error came from the backend failing (unreachable, erroring, too slow) rather
+/// than from the path.
+fn backend_failed(message: &str) -> bool {
+    [
+        "storage backend",
+        "The file server can't",
+        "The storage backend didn't",
+    ]
+    .iter()
+    .any(|start| message.starts_with(start))
+}
+
+pub(crate) fn redact_urls(text: &str) -> String {
     text.split(' ')
         .map(|word| if word.contains("://") { "[url]" } else { word })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn seconds(duration: Duration) -> String {
+pub(crate) fn seconds(duration: Duration) -> String {
     format!("{} s", duration.as_secs())
 }
 
@@ -1002,7 +1208,7 @@ fn complete_prefix_len(bytes: &[u8]) -> usize {
 }
 
 /// `512 bytes`, `1.5 KiB`, `3.0 MiB`. Rounds down so a limit is never overstated.
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
     if bytes < 1024 {
         return count(bytes as usize, "byte", "bytes");
@@ -1017,7 +1223,7 @@ fn human_size(bytes: u64) -> String {
     format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
 }
 
-fn count(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 

@@ -45,8 +45,8 @@ impl NameMatcher {
 }
 
 /// `text` folded the way names are matched: decomposed, without accents, in lower case. Two
-/// paths that fold alike name the same folder as far as `SEARCH_SKIP` is concerned.
-pub(crate) fn fold(text: &str) -> String {
+/// paths that fold alike name the same folder as far as the policy is concerned.
+pub fn fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     fold_into(text, &mut out);
     out

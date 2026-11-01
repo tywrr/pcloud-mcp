@@ -59,6 +59,10 @@ spec:
             - { name: data, mountPath: /var/lib/chance-of-files }
             - { name: core-tmp, mountPath: /tmp }
           resources:
+            # Measured on the owner's drive (139k entries): first walk of / and Immich peaks at
+            # ~115 MB, a re-walk at ~105 MB, ~215 MB at most with audits and duplicate hashing in
+            # between. Listings are parsed as a stream and diffed in SQLite; the limit leaves room
+            # for text extraction in a later version.
             requests: { cpu: 100m, memory: 256Mi }
             limits: { cpu: "2", memory: 2Gi }
           securityContext:
@@ -91,8 +95,8 @@ spec:
           volumeMounts:
             - { name: rclone-tmp, mountPath: /tmp }
           resources:
-            # Measured peaks: idle 84 MB, a recursive listing of 133k entries ~440 MB. Walks
-            # (from 0.3) run one at a time, so 1 Gi leaves about 2x headroom.
+            # Measured peaks: idle 84 MB, a recursive listing of 133k entries ~440 MB. The core's
+            # walks run one at a time, so 1 Gi leaves about 2x headroom.
             requests: { cpu: 50m, memory: 128Mi }
             limits: { cpu: "2", memory: 1Gi }
           securityContext:

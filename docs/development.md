@@ -42,7 +42,7 @@ mise run dev      # rclone rcd over fixtures/webdav-root on 127.0.0.1:5572, the 
 mise run smoke    # tools/list, then each tool, through the MCP Inspector CLI
 ```
 
-`deploy/dev.sh` (what `mise run dev` runs) defines rclone's remote `pcloud` as an alias of the folder it serves, so the server runs with the same `deploy/k8s/base/config.toml` as the pod. The dev token is `INTERNAL_TOKEN=dev-internal-token`; `RC_PASS` is random on each run, and rcd starts with an empty rclone config, so it can't reach your other remotes. Other sources:
+`deploy/dev.sh` (what `mise run dev` runs) defines rclone's remote `pcloud` as an alias of the folder it serves, so the server runs with the same `deploy/k8s/base/config.toml` as the pod. Its `/var/lib/chance-of-files` paths are pointed at a scratch directory made per run (removed on exit; `STATE_DIR=...` keeps one), so the index works locally and starts empty. The dev token is `INTERNAL_TOKEN=dev-internal-token`; `RC_PASS` is random on each run, and rcd starts with an empty rclone config, so it can't reach your other remotes. Other sources:
 
 ```bash
 mise run dev -- ~/some/folder          # a local folder

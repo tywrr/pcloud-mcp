@@ -1,4 +1,4 @@
-# chance-of-files configuration (v0.2, phase 1: read-only tools).
+# chance-of-files configuration (v0.3: read-only tools and the metadata index).
 #
 # The server reads this file from --config, else $CHANCE_OF_FILES_CONFIG, else
 # /etc/chance-of-files/config.toml. Every key is optional; the values below are the defaults.
@@ -21,9 +21,10 @@ deadline = "180s"
 # Browser origins allowed in an Origin header, on top of https://claude.ai and
 # https://claude.com, which are always allowed. Requests without an Origin are always allowed.
 allowed_origins = []
-# A writable directory for state kept across restarts (unused in phase 1; created at startup
-# if set). In the pod: a directory on the chance-of-files-data volume.
-# state_dir = "/var/lib/chance-of-files/state"
+# A writable directory for state kept across restarts, created at startup if set. The index
+# lives in its "index" subdirectory unless [index].dir says otherwise; later versions keep links
+# and jobs here too. In the pod: the chance-of-files-data volume.
+# state_dir = "/var/lib/chance-of-files"
 
 [rclone]
 # rclone rcd's remote-control address. Plain http on loopback only: the rc password can read
@@ -33,6 +34,10 @@ url = "http://127.0.0.1:5572"
 user = "core"
 # The rclone remote that holds the drive, with or without the trailing colon.
 remote = "pcloud"
+# How often the server checks that rclone (and pCloud behind it) works, with one cheap
+# operations/about call; a failing backend is checked every 30 s, and right after a call fails.
+# While it fails, index tools still answer and say since when; live calls fail fast.
+health_every = "5m"
 
 [policy]
 # Folders (or files) that don't exist as far as clients can tell: never listed, searched,
@@ -43,8 +48,8 @@ hidden = []
 # a later version; listed now so the rule is in place before writes exist).
 # protected = ["/Backups/Immich"]
 protected = []
-# Folders search_files doesn't go into (too big to search usefully). A search above one goes
-# around it without fetching it; list_folder still browses it.
+# Folders search_files leaves out of its results (and doesn't fetch, without an index);
+# list_folder still browses them.
 # search_skip = ["/Backups/Immich"]
 search_skip = []
 
@@ -62,7 +67,36 @@ max_image_bytes = 1572864
 # Most bytes of one rclone answer the server takes in. A recursive listing of ~133,000 entries
 # is ~35 MB; a bigger answer fails with "too many entries" instead of using more memory.
 max_listing_bytes = 64000000
-# Most results search_files returns.
+# Most results one search_files call returns; with the index, a cursor fetches more.
 search_limit = 50
 # Largest /mcp request body accepted.
 max_body_bytes = 1048576
+
+[index]
+# A SQLite index of every visible file and folder, kept current by walks, so list_folder,
+# search_files and the audit tools (folder_stats, query_files, find_duplicates, recent_changes,
+# type_breakdown, index_status, refresh_index) answer at once. Without a directory (neither dir
+# nor server.state_dir set), or with enabled = false, the server runs without it and every tool
+# asks rclone directly, as v0.2 did.
+enabled = true
+# Where index.db lives; default "<server.state_dir>/index". It is a cache: deleting it costs a
+# re-walk, and a corrupt one is moved aside and rebuilt.
+# dir = "/var/lib/chance-of-files/index"
+# A walk that would remove more than this share of a root's entries (and at least 10) applies
+# everything else and holds the removals until refresh_index confirm=true, so a flaky listing
+# can't empty the index.
+max_removal = 0.05
+# Files at least this big that share their size with another file get their hash fetched
+# (one API call each, in the background after walks) for find_duplicates.
+hash_min_size = 1048576
+hash_in_background = true
+
+# The roots to walk, each with its own schedule. A parent root's walk leaves child roots out
+# (they are walked on their own), so a big, slow-changing folder can be walked less often.
+# Hidden paths are never fetched. Paths outside every root are answered live.
+[[index.roots]]
+path = "/"
+every = "30m"
+# [[index.roots]]
+# path = "/Backups/Immich"
+# every = "6h"

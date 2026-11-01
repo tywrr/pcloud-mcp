@@ -1,6 +1,6 @@
 # Architecture
 
-How Chance of Files 0.2 is put together, and why. For running it, see [setup.md](setup.md); for working on it, [development.md](development.md). The full design, with what comes after 0.2, is [design/v2.md](design/v2.md).
+How Chance of Files 0.3 is put together, and why. For running it, see [setup.md](setup.md); for working on it, [development.md](development.md). The full design, with what comes after 0.3, is [design/v2.md](design/v2.md).
 
 ## Components
 
@@ -10,16 +10,17 @@ How Chance of Files 0.2 is put together, and why. For running it, see [setup.md]
 | `OAUTH_KV` | Workers KV | | OAuth clients, grants and token hashes |
 | Workers VPC service + Cloudflare Tunnel | Cloudflare | | A private path from the auth Worker's `CORE` binding to `127.0.0.1:8080` in the pod; the tunnel has no public hostname |
 | `cloudflared` | The pod | `cloudflare/cloudflared` image | The tunnel's connector; dials out over QUIC |
-| `chance-of-files` (the core) | The pod | `crates/server` (binary), `crates/core`, `crates/rclone` | MCP over Streamable HTTP (stateless), the tools, path policy, scopes; `/healthz` and `/readyz` |
+| `chance-of-files` (the core) | The pod | `crates/server` (binary), `crates/core`, `crates/rclone`, `crates/index` | MCP over Streamable HTTP (stateless), the tools, path policy, scopes; the index walks and the health check in the background; `/healthz` and `/readyz` |
 | `rclone rcd` | The pod | `rclone/rclone` image | rclone's remote-control API on loopback: listings, stat, ranged reads (`--rc-serve`) against the remote `pcloud` |
-| PVC `chance-of-files-data` | The node's disk | | `/var/lib/chance-of-files`: a state directory in 0.2; the index, mirror and link staging from later releases |
+| PVC `chance-of-files-data` | The node's disk | | `/var/lib/chance-of-files`: `index/index.db` from 0.3; link and job state, the mirror and upload staging from later releases |
 
 | Crate | What |
 |---|---|
 | `chance-of-files-core` (`crates/core`) | The MCP endpoint, JSON-RPC dispatch, the tools, the `Storage` trait, `Policy` and scopes. No I/O of its own; tests run against an in-memory store |
 | `crates/rclone` | `Storage` over rclone's rc API (`operations/list`, `operations/stat`, `--rc-serve` for ranged reads, `operations/about` for health) |
 | `chance-of-files-webdav` (`crates/webdav`) | `Storage` over WebDAV, for serving a local folder or a NAS instead of pCloud |
-| `crates/server` | The `chance-of-files` binary: axum on tokio, config file, internal-token check, routes |
+| `crates/index` | The metadata index: SQLite (rusqlite, bundled, WAL), split walks, walk guards, folder totals, duplicate hashing, the audit queries |
+| `crates/server` | The `chance-of-files` binary: axum on tokio, config file, internal-token check, routes, the walk scheduler and health check |
 
 ## Request flow
 
@@ -82,7 +83,7 @@ Each hop has its own credential, so a leak at one layer doesn't open the others.
 
 ### Why stateless MCP
 
-The endpoint is Streamable HTTP in stateless mode: every `POST /mcp` carries one JSON-RPC message and gets a plain JSON response, and there is no `Mcp-Session-Id`. Every tool is a read with no state between calls; paging uses explicit offsets. MCP 2025-11-25 makes sessions optional, Claude's connector client doesn't rely on them, and MCP 2026-07-28 moves further toward stateless requests. So `GET /mcp` and `DELETE /mcp` answer `405`, and notifications get `202`. `initialize` negotiates `2025-03-26`, `2025-06-18` and `2025-11-25`; `2026-07-28` clients put their version in each request's `_meta`. The dispatch is hand-written over [rmcp](https://crates.io/crates/rmcp)'s `model` types (design decision D1): rmcp's server runtime would bring sessions and SSE that buy nothing here.
+The endpoint is Streamable HTTP in stateless mode: every `POST /mcp` carries one JSON-RPC message and gets a plain JSON response, and there is no `Mcp-Session-Id`. Every tool is a read with no per-client state between calls; paging uses explicit offsets or opaque cursors that carry everything the next page needs. MCP 2025-11-25 makes sessions optional, Claude's connector client doesn't rely on them, and MCP 2026-07-28 moves further toward stateless requests. So `GET /mcp` and `DELETE /mcp` answer `405`, and notifications get `202`. `initialize` negotiates `2025-03-26`, `2025-06-18` and `2025-11-25`; `2026-07-28` clients put their version in each request's `_meta`. The dispatch is hand-written over [rmcp](https://crates.io/crates/rmcp)'s `model` types (design decision D1): rmcp's server runtime would bring sessions and SSE that buy nothing here.
 
 ### Routes
 
@@ -102,11 +103,56 @@ The tools see only the `Storage` trait; `crates/rclone` implements it over rclon
 |---|---|
 | `policy.hidden` | Never listed, searched or read; errors say "not found" |
 | `policy.protected` | Visible and readable; any write touching it is refused (from 0.4) |
-| `policy.search_skip` | `search_files` goes around these folders; Claude can still list and read them |
+| `policy.search_skip` | `search_files` leaves these folders out of its results; Claude can still list, read and audit them |
 
 **rclone runs with no filters at all.** Phase 0 measured that any directory filter makes rclone drop pCloud's recursive listing (a 133k-entry folder: 6 s became 133 s) and turn folder moves into per-file moves, and that filters don't affect single-object calls (`stat`, `copyfile`, `deletefile`, rc-serve `GET`) anyway ([phase0-rclone.md](design/phase0-rclone.md)). So `Policy` in the core is the only enforcement point, and the rclone client accepts only paths that `Policy` produced.
 
 `initialize` also reads the first 8 KiB of the owner's guide (`guide.path`, `/AGENTS.md` by default) and appends it to the instructions. Any error leaves it out.
+
+## The index
+
+From 0.3 the core keeps a metadata index of the drive, so listings, name searches and audit questions don't walk pCloud each time. It's a cache: everything in it can be rebuilt from pCloud, and deleting `index.db` only costs a first walk. (Design decision D3: one engine, SQLite, for this and for the full-text index of 0.5.)
+
+**What's in `index.db`.** One row per file and folder (path, parent, name and a case- and accent-folded copy of it, size, modified time, extension, kind, pCloud ID, root, walk generation), plus:
+
+| Table | Holds |
+|---|---|
+| `entries` | Every visible file and folder, with `own_write_at` and `deleted_at` columns the write tools of 0.4 will use to keep a walk from undoing them |
+| `folder_totals` | Per folder: files, subfolders, bytes and newest modified time, over everything below it, across roots |
+| `hashes` | SHA-1 and MD5 for files that took part in a duplicate check, keyed by pCloud ID and kept while size and modified time match |
+| `changes` | Adds, size/mtime changes, moves (same pCloud ID, new path) and removals, as each walk applies them; `recent_changes` reads it |
+| `roots` | Per root: interval, when the last walk started and finished, its error, generation, entry count, held removals |
+
+Links, jobs and the audit log of own writes go into a separate `state.db` in 0.4, because unlike the index they can't be rebuilt; the full-text index of 0.5 is `text.db`.
+
+**Roots and split walks.** `[index] roots` lists the folders walked on their own schedule; `/` is the default, and a huge, slow-changing tree such as a photo backup is worth its own root with a longer interval. Roots never overlap: a parent root's walk leaves out every child root and every `policy.hidden` path by **splitting the tree**, not by filtering. Each ancestor of an excluded path is listed on its own (non-recursively), and every sibling subtree is listed recursively in one `operations/list` call with no filter. For a drive with `/Backups/Immich` as a child root and `/Crypto Folder` hidden, walking `/` is about a dozen API calls and ~4 s at `--tpslimit=8`; rclone filters would have made it 716 calls and 90 s, and they'd still have fetched the hidden folder ([phase 0](design/phase0-rclone.md)). So hidden folders are never fetched, not even their names, and each entry belongs to exactly one root; the folder entry of a child root comes from its parent's walk. `folder_totals` adds up all roots, so `/`'s totals include the photo backup; result headers show each contributing root's own "as of".
+
+**Parsing big listings.** A recursive listing of a 133k-file folder is one ~35 MB JSON answer from rclone. The core parses it as a stream, entry by entry, into the walk's diff, instead of holding the whole document and a tree of values in memory; `limits.max_listing_bytes` caps how much it reads.
+
+**Walk guards.** Walks run one at a time, each root on its interval (30 min by default) and on `refresh_index`.
+
+- A walk records `walk_started` before it lists, and a failed walk changes nothing but `last_error`; the previous generation keeps answering.
+- Applying a walk: new entries are added, changed and moved ones updated (a move is the same pCloud ID at a new path), and rows the listing didn't contain are removed, each as a `changes` row. Two exceptions keep a walk from undoing the core's own writes (from 0.4): rows written by the core at or after `walk_started` stay as written, and tombstones of the core's own deletes made at or after `walk_started` aren't re-added (times are whole seconds, so a tie goes to the core's own write). Tombstones go once a walk that started after them completes.
+- A walk that never finished (the core stopped mid-walk) counts as failed at the next start: that root is walked again after the first back-off (2 minutes), not a whole interval later.
+- **Mass-removal hold.** A walk that would remove more than `max_removal` (5%) of a root's entries applies its adds and changes but holds the removals. `index_status` shows what's held ("walk of / at 14:05Z would remove 7,412 entries (6.1%)") and `refresh_index path=/ confirm=true` applies it. A flaky or truncated listing can't empty the index, or, in 0.5, the mirror through it. Any later walk, a subtree walk included, releases the held rows it sees again (and the folder it walked, and that folder's ancestors) and recounts what's still held; confirming also skips entries seen or written since the hold.
+
+**Duplicates.** pCloud listings carry no hashes, and each hash is one API call (`operations/stat` with `showHash`, 0.2–0.7 s). So `find_duplicates` groups by size in SQL first and hashes only files in a size collision of at least `min_size` (1 MiB by default), using the hash the backend reports in `operations/fsinfo` (SHA-1 and MD5 on pCloud US). Hashes are cached in `hashes` while size and modified time match, and filled lazily, a few at a time under rclone's `--tpslimit`; a result says when some groups are still matched by size only.
+
+**Health check.** `operations/about` (0.16 s) every 5 minutes and after any rclone error. While it fails, index tools keep answering with their "as of" and every result header adds `backend unhealthy since 13:40Z: <error>`; live calls (`get_file_info`, reads, `list_folder live=true`) fail fast with the same message, and walks pause with backoff. `index_status` shows it too.
+
+**What answers from where.**
+
+| Tool | Source |
+|---|---|
+| `list_folder` | The index, sortable and paged; `live=true` → `operations/list` through rclone |
+| `get_file_info` | Live `operations/stat` (hash with `hash=true`), plus folder totals from the index |
+| `read_text_file`, `read_image` | rclone, live (the mirror of 0.5 will serve fresh copies) |
+| `search_files` | The index: folded name match over the whole drive (minus `search_skip`) |
+| `folder_stats`, `query_files`, `type_breakdown`, `recent_changes` | SQL over `entries`, `folder_totals` and `changes` |
+| `find_duplicates` | SQL by size, then cached or freshly fetched hashes |
+| `index_status`, `refresh_index` | The `roots` table, the health check; `refresh_index` queues a walk and returns at once |
+
+Every index tool returns a header line, for example `[rows 1-500 of 13,204 · / as of 14:05Z, /Backups/Immich as of 09:00Z · next cursor=…]`, keeps its result under 120,000 characters, and pages with an opaque cursor that encodes the last row's sort key and the index generation. Audit tools also return `structuredContent`. Hidden paths are never in the index, so they can't appear in a result; `policy.protected` only matters for writes.
 
 ## Configuration
 
@@ -114,11 +160,14 @@ One TOML file, from `--config`, else `CHANCE_OF_FILES_CONFIG`, else `/etc/chance
 
 | Section | Keys |
 |---|---|
-| `[server]` | `listen` (`127.0.0.1:8080`), `deadline` (`180s`), `allowed_origins` |
-| `[rclone]` | `url` (`http://127.0.0.1:5572`), `user` (`core`), `remote` (`pcloud`) |
+| `[server]` | `listen` (`127.0.0.1:8080`), `deadline` (`180s`), `allowed_origins`, `state_dir` (unset; the base sets `/var/lib/chance-of-files`) |
+| `[rclone]` | `url` (`http://127.0.0.1:5572`), `user` (`core`), `remote` (`pcloud`), `health_every` (`5m`) |
 | `[policy]` | `hidden`, `protected`, `search_skip` |
+| `[index]` | `enabled` (`true`), `dir` (`<server.state_dir>/index`, where `index.db` lives), `max_removal` (`0.05`), `hash_min_size` (`1048576`), `hash_in_background` (`true`), `roots` (`[{ path = "/", every = "30m" }]`) |
 | `[guide]` | `path` (`/AGENTS.md`) |
 | `[limits]` | `max_read_bytes`, `max_image_bytes`, `max_listing_bytes` |
+
+The index is off unless it has somewhere to live: `[index].dir`, or `[server].state_dir` (it then uses `<state_dir>/index`). With neither set (the built-in defaults) the server runs as 0.2 did, every tool asking rclone directly and no audit tools, and logs a warning at startup; `enabled = false` turns it off on purpose.
 
 ## The pod
 
@@ -134,7 +183,10 @@ One TOML file, from `--config`, else `CHANCE_OF_FILES_CONFIG`, else `/etc/chance
 |---|---|---|
 | Text per `read_text_file` call | 100,000 bytes (`limits.max_read_bytes`) | This project, under Claude's ~150,000-character cap on a tool result |
 | Image size for `read_image` | 1.5 MiB (`limits.max_image_bytes`) | This project; base64 makes it a third larger in the result |
-| One rclone listing the core parses | 64 MB (`limits.max_listing_bytes`) | This project; a recursive listing of 133k entries is ~35 MB |
+| One rclone listing the core parses | 64 MB (`limits.max_listing_bytes`) | This project; a recursive listing of 133k entries is ~35 MB, parsed as a stream |
+| Characters per tool result | 120,000, then a cursor | This project, under Claude's ~150,000-character cap |
+| Index freshness | One walk per root per `every` (30 min by default) | This project; rclone's pCloud app has no change feed |
+| Mass removal held for confirmation | More than 5% of a root's entries (`index.max_removal`) | This project |
 | Time per tool call | 180 s (`server.deadline`); Claude allows 240 s | 200 s measured to pass end to end ([phase0-network.md](design/phase0-network.md)) |
 | pCloud API calls | 8 per second (`--tpslimit=8`) | This project, to stay well inside pCloud's limits |
 | Request body through Cloudflare | 100 MB | Cloudflare (matters for uploads, from 0.4) |

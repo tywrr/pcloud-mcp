@@ -20,33 +20,43 @@ pub async fn split_walk<S: Storage + ?Sized>(
     root: &CheckedPath,
     exclude: &[CheckedPath],
 ) -> Result<Vec<Entry>, StorageError> {
-    let exclude = PathSet::new(exclude.iter().map(CheckedPath::as_str))?;
     let mut out = Vec::new();
-    split_into(storage, root, &exclude, &mut out).await?;
+    split_walk_each(storage, root, exclude, &mut |entry| out.push(entry)).await?;
     Ok(out)
+}
+
+/// [`split_walk`], handing entries over as they arrive; whole subtrees go through
+/// [`Storage::walk_each`] with nothing to exclude.
+pub async fn split_walk_each<S: Storage + ?Sized>(
+    storage: &S,
+    root: &CheckedPath,
+    exclude: &[CheckedPath],
+    each: &mut (dyn FnMut(Entry) + Send),
+) -> Result<(), StorageError> {
+    let exclude = PathSet::new(exclude.iter().map(CheckedPath::as_str))?;
+    split_into(storage, root, &exclude, each).await
 }
 
 fn split_into<'a, S: Storage + ?Sized>(
     storage: &'a S,
     dir: &'a CheckedPath,
     exclude: &'a PathSet,
-    out: &'a mut Vec<Entry>,
+    each: &'a mut (dyn FnMut(Entry) + Send),
 ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'a>> {
     Box::pin(async move {
         if exclude.covers(dir.as_str()) {
             return Ok(());
         }
         if !exclude.any_below(dir.as_str()) {
-            out.extend(storage.walk(dir, &[]).await?);
-            return Ok(());
+            return storage.walk_each(dir, &[], each).await;
         }
         let children = storage.list(dir).await?;
         for child in children {
             let path = dir.child(&child.name);
             let descend = child.is_dir && !exclude.covers(path.as_str());
-            out.push(child);
+            each(child);
             if descend {
-                split_into(storage, &path, exclude, out).await?;
+                split_into(storage, &path, exclude, &mut *each).await?;
             }
         }
         Ok(())

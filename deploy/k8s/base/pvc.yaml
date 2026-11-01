@@ -1,6 +1,6 @@
-# The core's data volume, mounted at /var/lib/chance-of-files. Phase 1 keeps only a small state
-# directory here; the index, mirror and link staging of later releases live here too, which is why
-# it is sized well beyond what 0.2 uses. The default StorageClass provisions it; an overlay can bind
+# The core's data volume, mounted at /var/lib/chance-of-files. 0.3 keeps the index here
+# (index/index.db, ~90 MB for 139k entries); the mirror and link staging of later releases live
+# here too, which is why it is sized well beyond what 0.3 uses. The default StorageClass provisions it; an overlay can bind
 # it to a pre-made PersistentVolume instead (volumeName + storageClassName).
 apiVersion: v1
 kind: PersistentVolumeClaim

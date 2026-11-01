@@ -170,7 +170,7 @@ fn tools_list_has_five_valid_tools() {
         let properties = schema["properties"].as_object().unwrap();
         for property in properties.values() {
             let kind = property["type"].as_str().unwrap();
-            assert!(["string", "integer"].contains(&kind), "{name}");
+            assert!(["string", "integer", "boolean"].contains(&kind), "{name}");
             assert!(property["description"].is_string(), "{name}");
         }
         for required in schema["required"].as_array().into_iter().flatten() {

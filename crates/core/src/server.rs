@@ -6,6 +6,7 @@
 //! version and their capabilities in each request's `_meta`; those requests also get the
 //! stricter header checks and result fields that revision asks for.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -15,7 +16,9 @@ use rmcp::model::{
 };
 use serde_json::{Map, Value, json};
 
+use crate::health::Health;
 use crate::http::{HttpRequest, HttpResponse};
+use crate::index::Index;
 use crate::policy::Policy;
 use crate::scope::Scopes;
 use crate::storage::{ByteRange, Storage, read_capped};
@@ -118,6 +121,14 @@ read_image shows PNG, JPEG, GIF and WebP pictures. \
 If the owner wrote a guide to their files, it ends these instructions and says what each folder \
 is for.";
 
+const INDEX_INSTRUCTIONS: &str = " \
+The server keeps an index of the whole drive, refreshed by periodic walks: list_folder, \
+search_files and the audit tools answer from it instantly and their first line says how current \
+it is. For storage questions (\"where did my space go\", largest files, duplicates, what \
+changed) start with folder_stats or query_files rather than listing folder by folder. \
+list_folder with live=true and get_file_info ask the drive itself. index_status shows walks \
+and problems; refresh_index re-walks after changes made elsewhere.";
+
 /// Which protocol rules a request follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Era {
@@ -200,6 +211,8 @@ pub struct McpServer<S: Storage> {
     storage: S,
     config: ServerConfig,
     policy: Policy,
+    index: Option<Arc<dyn Index>>,
+    health: Arc<Health>,
 }
 
 impl<S: Storage> McpServer<S> {
@@ -209,12 +222,34 @@ impl<S: Storage> McpServer<S> {
             storage,
             config,
             policy: Policy::default(),
+            index: None,
+            health: Arc::new(Health::new()),
         }
     }
 
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Answers from the metadata index where it can, and adds the audit tools.
+    pub fn with_index(mut self, index: Arc<dyn Index>) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// Shares the backend's health with the checker that updates it.
+    pub fn with_health(mut self, health: Arc<Health>) -> Self {
+        self.health = health;
+        self
+    }
+
+    pub fn health(&self) -> &Arc<Health> {
+        &self.health
+    }
+
+    pub fn index(&self) -> Option<&Arc<dyn Index>> {
+        self.index.as_ref()
     }
 
     pub fn storage(&self) -> &S {
@@ -419,6 +454,9 @@ impl<S: Storage> McpServer<S> {
     /// The fixed instructions, the folders search skips, and the owner's guide if there is one.
     async fn instructions(&self) -> String {
         let mut text = String::from(INSTRUCTIONS);
+        if self.index.is_some() {
+            text.push_str(INDEX_INSTRUCTIONS);
+        }
         let skipped = self.policy.search_skip().paths();
         if !skipped.is_empty() {
             text.push_str(" Search is turned off under ");
@@ -486,7 +524,11 @@ impl<S: Storage> McpServer<S> {
     }
 
     fn list_tools(&self, era: Era, scopes: Scopes) -> Value {
-        let mut result = ListToolsResult::with_all_items(tools::definitions(&self.config, scopes));
+        let mut result = ListToolsResult::with_all_items(tools::definitions(
+            &self.config,
+            scopes,
+            self.index.is_some(),
+        ));
         if era == Era::Stateless {
             result = result
                 .with_ttl_ms(LIST_TTL_MS)
@@ -514,7 +556,13 @@ impl<S: Storage> McpServer<S> {
                 ));
             }
         };
-        let ctx = tools::Ctx::new(&self.storage, &self.config, &self.policy);
+        let ctx = tools::Ctx::new(
+            &self.storage,
+            &self.config,
+            &self.policy,
+            self.index.as_ref(),
+            &self.health,
+        );
         match tools::call(&ctx, name, args, scopes).await {
             Called::Done(result) => Ok(to_json(&result)),
             Called::Unknown => Err(RpcError::invalid_params(format!("Unknown tool: {name}"))),

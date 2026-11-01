@@ -13,10 +13,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use chance_of_files_core::McpServer;
+use chance_of_files_core::{Health, McpServer};
 use chance_of_files_rclone::RcloneStorage;
 use chance_of_files_server::config::{self, DEFAULT_CONFIG_PATH};
-use chance_of_files_server::{App, router};
+use chance_of_files_server::{App, health_loop, router};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: chance-of-files [--config PATH]\n\nSee config.example.toml for the \
@@ -105,22 +105,56 @@ fn config_path(mut args: impl Iterator<Item = String>) -> Result<Option<PathBuf>
 
 async fn serve(settings: config::Settings) -> Result<(), String> {
     if let Some(dir) = &settings.state_dir {
-        // Nothing is kept there yet; creating it now shows a volume problem at startup.
+        // Phase 3 keeps state.db here; creating it now shows a volume problem at startup.
         if let Err(e) = std::fs::create_dir_all(dir) {
             tracing::warn!(dir = %dir.display(), error = %e, "can't create the state directory");
         }
     }
-    let storage = RcloneStorage::new(settings.rclone)?;
+    let storage = Arc::new(RcloneStorage::new(settings.rclone)?);
     let fs = storage.fs().to_owned();
-    let mcp = McpServer::new(storage, settings.core).with_policy(settings.policy);
+    let health = Arc::new(Health::new());
+    let mut mcp = McpServer::new(storage.clone(), settings.core)
+        .with_policy(settings.policy.clone())
+        .with_health(health.clone());
+
+    // Without a usable index the server still works, live, as v0.2 did.
+    let mut indexer = None;
+    match settings.index {
+        None if settings.index_needs_dir => tracing::warn!(
+            "the index is off: neither [index].dir nor [server].state_dir is set, so there is \
+             nowhere to keep it; every tool asks rclone directly and the audit tools are missing"
+        ),
+        None => tracing::info!("the index is turned off; every tool asks rclone directly"),
+        Some(config) => {
+            let dir = config.dir.display().to_string();
+            let roots: Vec<String> = config.roots.iter().map(|r| r.path.clone()).collect();
+            match chance_of_files_index::open(
+                config,
+                settings.policy,
+                health.clone(),
+                storage.clone(),
+            ) {
+                Ok((handle, background)) => {
+                    tracing::info!(dir = %dir, ?roots, "index open");
+                    mcp = mcp.with_index(handle);
+                    indexer = Some(background);
+                }
+                Err(e) => {
+                    tracing::error!(dir = %dir, error = %e, "can't open the index; serving without it");
+                }
+            }
+        }
+    }
     let app = Arc::new(App::new(
         mcp,
         settings.internal_token,
         settings.max_body_bytes,
     ));
 
-    // rclone may start after us in the pod; capabilities are looked up until it answers.
+    // rclone may start after us in the pod; capabilities are looked up until it answers, and
+    // only then do health checks and walks start.
     let probe = app.clone();
+    let health_every = settings.health_every;
     tokio::spawn(async move {
         let mut wait = std::time::Duration::from_secs(1);
         loop {
@@ -136,6 +170,14 @@ async fn serve(settings: config::Settings) -> Result<(), String> {
                     wait = (wait * 2).min(std::time::Duration::from_secs(60));
                 }
             }
+        }
+        tokio::spawn(health_loop(
+            probe.mcp.storage().clone(),
+            probe.mcp.health().clone(),
+            health_every,
+        ));
+        if let Some(indexer) = indexer {
+            indexer.run().await;
         }
     });
 

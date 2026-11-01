@@ -11,12 +11,16 @@ listen = "127.0.0.1:8080"
 deadline = "180s"
 # Browser origins allowed to send an Origin header; requests without one (the auth Worker) pass.
 allowed_origins = ["https://claude.ai", "https://claude.com"]
+# The chance-of-files-data volume: the index (and later links and jobs) live here.
+state_dir = "/var/lib/chance-of-files"
 
 [rclone]
 url = "http://127.0.0.1:5572"
 user = "core"
 # The remote the rclone container defines from env vars (RCLONE_CONFIG_PCLOUD_*).
 remote = "pcloud"
+# operations/about every 5 minutes (every 30 s while it fails).
+health_every = "5m"
 
 [policy]
 # Never listed, read or searched; errors say "not found". pCloud's client-side encrypted folder
@@ -24,7 +28,7 @@ remote = "pcloud"
 hidden = ["/Crypto Folder"]
 # Visible and readable, never written (enforced once write tools exist).
 protected = []
-# Folders search_files goes around, for huge trees such as a photo backup.
+# Folders search_files leaves out, for huge trees such as a photo backup.
 search_skip = []
 
 [guide]
@@ -35,3 +39,16 @@ path = "/AGENTS.md"
 max_read_bytes = 100_000      # text per read_text_file call, under Claude's ~150k-character cap
 max_image_bytes = 1_572_864   # 1.5 MiB, before base64
 max_listing_bytes = 64_000_000 # one rclone listing; a 133k-entry recursive listing is ~35 MB
+
+[index]
+# index.db on the data volume. Walks hold back removals of more than 5% of a root until
+# refresh_index confirm=true.
+dir = "/var/lib/chance-of-files/index"
+max_removal = 0.05
+hash_min_size = 1048576
+
+# The whole drive every 30 minutes. An overlay can add big folders as roots of their own with a
+# slower schedule, e.g. path = "/Backups/Immich", every = "6h".
+[[index.roots]]
+path = "/"
+every = "30m"

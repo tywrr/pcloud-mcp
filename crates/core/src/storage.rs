@@ -5,7 +5,9 @@
 //! so a hidden path never reaches a backend.
 
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -160,6 +162,22 @@ pub trait Storage: Send + Sync {
         root: &CheckedPath,
         exclude: &[CheckedPath],
     ) -> Result<Vec<Entry>, StorageError>;
+    /// Like [`Storage::walk`], handing each entry to `each` as it arrives instead of
+    /// collecting them, so a walk of 130k entries never holds the whole listing twice.
+    /// Backends that can stream a listing override it.
+    fn walk_each<'a>(
+        &'a self,
+        root: &'a CheckedPath,
+        exclude: &'a [CheckedPath],
+        each: &'a mut (dyn FnMut(Entry) + Send),
+    ) -> impl Future<Output = Result<(), StorageError>> {
+        async move {
+            for entry in self.walk(root, exclude).await? {
+                each(entry);
+            }
+            Ok(())
+        }
+    }
     async fn stat(&self, path: &CheckedPath, with_hash: bool) -> Result<Entry, StorageError>;
     /// The bytes of a file, all of it or `range`. A range past the end is empty, not an error.
     async fn open(
@@ -169,6 +187,50 @@ pub trait Storage: Send + Sync {
     ) -> Result<ByteStream, StorageError>;
     /// A cheap check that the backend works, for readiness probes.
     async fn health(&self) -> Result<(), StorageError>;
+}
+
+/// So the server and the background indexer can share one backend.
+impl<T: Storage> Storage for Arc<T> {
+    fn capabilities(&self) -> Capabilities {
+        (**self).capabilities()
+    }
+
+    async fn list(&self, path: &CheckedPath) -> Result<Vec<Entry>, StorageError> {
+        (**self).list(path).await
+    }
+
+    async fn walk(
+        &self,
+        root: &CheckedPath,
+        exclude: &[CheckedPath],
+    ) -> Result<Vec<Entry>, StorageError> {
+        (**self).walk(root, exclude).await
+    }
+
+    async fn walk_each(
+        &self,
+        root: &CheckedPath,
+        exclude: &[CheckedPath],
+        each: &mut (dyn FnMut(Entry) + Send),
+    ) -> Result<(), StorageError> {
+        (**self).walk_each(root, exclude, each).await
+    }
+
+    async fn stat(&self, path: &CheckedPath, with_hash: bool) -> Result<Entry, StorageError> {
+        (**self).stat(path, with_hash).await
+    }
+
+    async fn open(
+        &self,
+        path: &CheckedPath,
+        range: Option<ByteRange>,
+    ) -> Result<ByteStream, StorageError> {
+        (**self).open(path, range).await
+    }
+
+    async fn health(&self) -> Result<(), StorageError> {
+        (**self).health().await
+    }
 }
 
 /// Turns user input into an absolute path such as `/` or `/Library/notes.md`: collapses

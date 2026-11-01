@@ -21,7 +21,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use chance_of_files_core::{
     ByteRange, ByteStream, Capabilities, CheckedPath, Entry, HashKind, PathSet, Storage,
-    StorageError, split_walk,
+    StorageError, split_walk_each,
 };
 use futures_util::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -215,17 +215,38 @@ impl RcloneStorage {
         body: Value,
         path: &str,
     ) -> Result<T, StorageError> {
+        let response = self.send(method, body).await?;
+        let status = response.status();
+        let body = self.read_body(response, path).await?;
+        if status.is_success() {
+            return serde_json::from_slice(&body).map_err(|e| {
+                StorageError::Backend(format!(
+                    "rclone {} answered unexpected JSON: {e}",
+                    method.path()
+                ))
+            });
+        }
+        Err(rc_error(method, status, &body, path))
+    }
+
+    async fn send(&self, method: Method, body: Value) -> Result<reqwest::Response, StorageError> {
         let url = format!("{}/{}", self.base, method.path());
-        let response = self
-            .http
+        self.http
             .post(url)
             .header(AUTHORIZATION, self.authorization.clone())
             .header(CONTENT_TYPE, "application/json")
             .body(body.to_string())
             .send()
             .await
-            .map_err(|e| transport_error(method.path(), e))?;
-        let status = response.status();
+            .map_err(|e| transport_error(method.path(), e))
+    }
+
+    /// A whole answer, up to `max_listing_bytes`.
+    async fn read_body(
+        &self,
+        response: reqwest::Response,
+        path: &str,
+    ) -> Result<Vec<u8>, StorageError> {
         let limit = self.max_listing_bytes;
         let too_big = || {
             StorageError::TooManyEntries(format!(
@@ -238,82 +259,151 @@ impl RcloneStorage {
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| transport_error(method.path(), e))?;
+            let chunk = chunk.map_err(|e| transport_error("rc answer", e))?;
             if (body.len() + chunk.len()) as u64 > limit {
                 return Err(too_big());
             }
             body.extend_from_slice(&chunk);
         }
-        if status.is_success() {
-            return serde_json::from_slice(&body).map_err(|e| {
-                StorageError::Backend(format!(
-                    "rclone {} answered unexpected JSON: {e}",
-                    method.path()
-                ))
-            });
-        }
-        Err(rc_error(method, status, &body, path))
+        Ok(body)
     }
+}
 
-    fn entry(&self, item: Item) -> Entry {
-        let path = format!("/{}", item.path.trim_start_matches('/'));
-        let size = (!item.is_dir)
-            .then(|| u64::try_from(item.size).ok())
-            .flatten();
-        Entry {
-            name: if item.name.is_empty() {
-                path.rsplit('/').next().unwrap_or("").to_owned()
-            } else {
-                item.name
-            },
-            path,
-            is_dir: item.is_dir,
-            size,
-            modified: item.mod_time.as_deref().map(utc_seconds),
-            content_type: item
-                .mime_type
-                .filter(|m| !item.is_dir && !m.is_empty() && m != "inode/directory"),
-            id: item.id.filter(|id| !id.is_empty()),
-            hashes: item
-                .hashes
-                .into_iter()
-                .flatten()
-                .filter_map(|(kind, value)| {
-                    let value = value.as_str()?.to_owned();
-                    Some((HashKind::from_name(&kind)?, value)).filter(|(_, v)| !v.is_empty())
-                })
-                .collect(),
-        }
+fn entry(item: Item) -> Entry {
+    let path = format!("/{}", item.path.trim_start_matches('/'));
+    let size = (!item.is_dir)
+        .then(|| u64::try_from(item.size).ok())
+        .flatten();
+    Entry {
+        name: if item.name.is_empty() {
+            path.rsplit('/').next().unwrap_or("").to_owned()
+        } else {
+            item.name
+        },
+        path,
+        is_dir: item.is_dir,
+        size,
+        modified: item.mod_time.as_deref().map(utc_seconds),
+        content_type: item
+            .mime_type
+            .filter(|m| !item.is_dir && !m.is_empty() && m != "inode/directory"),
+        id: item.id.filter(|id| !id.is_empty()),
+        hashes: item
+            .hashes
+            .into_iter()
+            .flatten()
+            .filter_map(|(kind, value)| {
+                let value = value.as_str()?.to_owned();
+                Some((HashKind::from_name(&kind)?, value)).filter(|(_, v)| !v.is_empty())
+            })
+            .collect(),
     }
+}
 
-    /// `operations/list` of one folder, plain or recursive. Items outside the folder (which
-    /// rclone never sends) are dropped rather than trusted.
-    async fn list_items(
+impl RcloneStorage {
+    /// `operations/list` of one folder, plain or recursive, each entry handed to `each` as
+    /// it is parsed. Items outside the folder (which rclone never sends) are dropped rather
+    /// than trusted.
+    async fn list_each(
         &self,
         dir: &CheckedPath,
         recurse: bool,
-    ) -> Result<Vec<Entry>, StorageError> {
+        each: &mut (dyn FnMut(Entry) + Send),
+    ) -> Result<(), StorageError> {
         let mut opt = serde_json::Map::new();
         if recurse {
             opt.insert("recurse".into(), json!(true));
         }
         let body = json!({"fs": self.fs, "remote": dir.relative(), "opt": opt});
-        let listed: Listing = match self.rc(Method::List, body, dir.as_str()).await {
-            Ok(listed) => listed,
-            Err(StorageError::NotFound(_)) => return Err(self.why_unlistable(dir).await),
-            Err(err) => return Err(err),
-        };
         let prefix = if dir.is_root() {
             "/".to_owned()
         } else {
             format!("{}/", dir.as_str())
         };
-        Ok(listed
-            .list
-            .into_iter()
-            .map(|item| self.entry(item))
-            .filter(|e| e.path.starts_with(&prefix) && e.path.len() > prefix.len())
-            .collect())
+        let mut keep = |entry: Entry| {
+            if entry.path.starts_with(&prefix) && entry.path.len() > prefix.len() {
+                each(entry);
+            }
+        };
+        match self.rc_list(body, dir.as_str(), &mut keep).await {
+            Err(StorageError::NotFound(_)) => Err(self.why_unlistable(dir).await),
+            other => other,
+        }
+    }
+
+    /// One `operations/list` call whose answer is parsed as it arrives, on a blocking thread:
+    /// a recursive listing of Immich is a 35 MB body, and neither it nor a vector of every
+    /// item is ever held whole.
+    async fn rc_list(
+        &self,
+        body: Value,
+        path: &str,
+        each: &mut (dyn FnMut(Entry) + Send),
+    ) -> Result<(), StorageError> {
+        let method = Method::List;
+        let response = self.send(method, body).await?;
+        let status = response.status();
+        let limit = self.max_listing_bytes;
+        let too_big = || {
+            StorageError::TooManyEntries(format!(
+                "{path} (an rclone answer over the {limit}-byte limit)"
+            ))
+        };
+        if response.content_length().is_some_and(|n| n > limit) {
+            return Err(too_big());
+        }
+        if !status.is_success() {
+            let body = self.read_body(response, path).await?;
+            return Err(rc_error(method, status, &body, path));
+        }
+
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Pump>>(8);
+        let (items_tx, mut items_rx) = tokio::sync::mpsc::channel::<Entry>(1024);
+        let parser = tokio::task::spawn_blocking(move || {
+            let reader = ChunkReader {
+                chunks: chunks_rx,
+                current: Bytes::new(),
+            };
+            parse_listing(reader, &items_tx)
+        });
+        let pump = async move {
+            let mut stream = response.bytes_stream();
+            let mut seen: u64 = 0;
+            while let Some(chunk) = stream.next().await {
+                let item = match chunk {
+                    Ok(chunk) => {
+                        seen += chunk.len() as u64;
+                        if seen > limit {
+                            Err(Pump::TooBig)
+                        } else {
+                            Ok(chunk)
+                        }
+                    }
+                    Err(e) => Err(Pump::Transport(transport_error(method.path(), e))),
+                };
+                let failed = item.is_err();
+                // The parser hung up: it failed, and says why itself.
+                if chunks_tx.send(item).await.is_err() || failed {
+                    return;
+                }
+            }
+        };
+        let receive = async {
+            while let Some(entry) = items_rx.recv().await {
+                each(entry);
+            }
+        };
+        let ((), ()) = tokio::join!(pump, receive);
+        match parser.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(ParseError::Pump(Pump::TooBig))) => Err(too_big()),
+            Ok(Err(ParseError::Pump(Pump::Transport(err)))) => Err(err),
+            Ok(Err(ParseError::Json(e))) => Err(StorageError::Backend(format!(
+                "rclone {} answered unexpected JSON: {e}",
+                method.path()
+            ))),
+            Err(e) => Err(StorageError::Backend(format!("listing parser failed: {e}"))),
+        }
     }
 
     /// rclone says "directory not found" for a file too; a stat tells them apart.
@@ -342,7 +432,9 @@ impl Storage for RcloneStorage {
     }
 
     async fn list(&self, path: &CheckedPath) -> Result<Vec<Entry>, StorageError> {
-        self.list_items(path, false).await
+        let mut out = Vec::new();
+        self.list_each(path, false, &mut |e| out.push(e)).await?;
+        Ok(out)
     }
 
     async fn walk(
@@ -350,14 +442,25 @@ impl Storage for RcloneStorage {
         root: &CheckedPath,
         exclude: &[CheckedPath],
     ) -> Result<Vec<Entry>, StorageError> {
+        let mut out = Vec::new();
+        self.walk_each(root, exclude, &mut |e| out.push(e)).await?;
+        Ok(out)
+    }
+
+    async fn walk_each(
+        &self,
+        root: &CheckedPath,
+        exclude: &[CheckedPath],
+        each: &mut (dyn FnMut(Entry) + Send),
+    ) -> Result<(), StorageError> {
         let excluded = PathSet::new(exclude.iter().map(CheckedPath::as_str))?;
         if excluded.covers(root.as_str()) {
-            return Ok(Vec::new());
+            return Ok(());
         }
         if excluded.any_below(root.as_str()) {
-            return split_walk(self, root, exclude).await;
+            return split_walk_each(self, root, exclude, each).await;
         }
-        self.list_items(root, true).await
+        self.list_each(root, true, each).await
     }
 
     async fn stat(&self, path: &CheckedPath, with_hash: bool) -> Result<Entry, StorageError> {
@@ -377,7 +480,7 @@ impl Storage for RcloneStorage {
         let item = stat
             .item
             .ok_or_else(|| StorageError::NotFound(path.to_string()))?;
-        let mut entry = self.entry(item);
+        let mut entry = entry(item);
         // The path asked for, as the policy checked it, not as rclone spells it back.
         entry.path = path.to_string();
         Ok(entry)
@@ -452,6 +555,134 @@ impl Storage for RcloneStorage {
     async fn health(&self) -> Result<(), StorageError> {
         self.about().await.map(|_| ())
     }
+}
+
+/// Why the body pump stopped feeding the parser.
+#[derive(Debug)]
+enum Pump {
+    TooBig,
+    Transport(StorageError),
+}
+
+#[derive(Debug)]
+enum ParseError {
+    Pump(Pump),
+    Json(serde_json::Error),
+}
+
+/// The answer's chunks as a `Read`, for serde_json on a blocking thread.
+struct ChunkReader {
+    chunks: tokio::sync::mpsc::Receiver<Result<Bytes, Pump>>,
+    current: Bytes,
+}
+
+/// Carries a pump failure through serde_json's `io::Error`.
+#[derive(Debug)]
+struct PumpFailed(Pump);
+
+impl fmt::Display for PumpFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the rclone answer stopped")
+    }
+}
+
+impl std::error::Error for PumpFailed {}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            match self.chunks.blocking_recv() {
+                Some(Ok(chunk)) => self.current = chunk,
+                Some(Err(pump)) => {
+                    return Err(std::io::Error::other(PumpFailed(pump)));
+                }
+                None => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current[..n]);
+        self.current = self.current.slice(n..);
+        Ok(n)
+    }
+}
+
+/// Parses `{"list": [item, ...]}` item by item, sending each as an [`Entry`].
+fn parse_listing(
+    reader: ChunkReader,
+    items: &tokio::sync::mpsc::Sender<Entry>,
+) -> Result<(), ParseError> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct Top<'a>(&'a tokio::sync::mpsc::Sender<Entry>);
+    struct List<'a>(&'a tokio::sync::mpsc::Sender<Entry>);
+
+    impl<'de> DeserializeSeed<'de> for Top<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Top<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an operations/list answer")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == "list" {
+                    map.next_value_seed(List(self.0))?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for List<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for List<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of items")
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while let Some(item) = seq.next_element::<Item>()? {
+                if self.0.blocking_send(entry(item)).is_err() {
+                    // The receiver is gone (the walk was dropped); stop parsing.
+                    return Err(serde::de::Error::custom("listing abandoned"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let result = Top(items).deserialize(&mut de).and_then(|()| de.end());
+    result.map_err(|e| {
+        if e.io_error_kind().is_none() {
+            return ParseError::Json(e);
+        }
+        let io: std::io::Error = e.into();
+        match io.into_inner().map(|inner| inner.downcast::<PumpFailed>()) {
+            Some(Ok(failed)) => ParseError::Pump(failed.0),
+            Some(Err(other)) => {
+                ParseError::Json(serde_json::Error::io(std::io::Error::other(other)))
+            }
+            None => ParseError::Json(serde_json::Error::io(std::io::Error::other(
+                "reading the answer failed",
+            ))),
+        }
+    })
 }
 
 /// The body from `skip` bytes in, at most `take` bytes, stopping the transfer once it has
@@ -575,12 +806,6 @@ struct Item {
 }
 
 #[derive(Debug, Deserialize)]
-struct Listing {
-    #[serde(default)]
-    list: Vec<Item>,
-}
-
-#[derive(Debug, Deserialize)]
 struct Stat {
     item: Option<Item>,
 }
@@ -622,6 +847,55 @@ mod tests {
                 assert!(!path.contains(forbidden), "{path}");
             }
         }
+    }
+
+    /// Feeds `body` to the streaming parser in `chunk`-byte pieces.
+    fn parse_in_pieces(body: &[u8], chunk: usize) -> (Vec<Entry>, Result<(), ParseError>) {
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel(body.len() / chunk + 2);
+        for piece in body.chunks(chunk) {
+            chunks_tx
+                .try_send(Ok(Bytes::copy_from_slice(piece)))
+                .unwrap();
+        }
+        drop(chunks_tx);
+        let (items_tx, mut items_rx) = tokio::sync::mpsc::channel(1000);
+        let reader = ChunkReader {
+            chunks: chunks_rx,
+            current: Bytes::new(),
+        };
+        let result = parse_listing(reader, &items_tx);
+        drop(items_tx);
+        let mut entries = Vec::new();
+        while let Ok(entry) = items_rx.try_recv() {
+            entries.push(entry);
+        }
+        (entries, result)
+    }
+
+    #[test]
+    fn listings_parse_as_a_stream_whatever_the_chunking() {
+        let body = br#"{"other": [1, {"x": "y"}], "list": [
+            {"Path": "a/b.txt", "Name": "b.txt", "Size": 3, "ModTime": "2026-10-29T12:00:00.5Z", "IsDir": false, "ID": "f1"},
+            {"Path": "a/c", "Name": "c", "Size": -1, "IsDir": true, "ID": "d2", "MimeType": "inode/directory"}
+        ], "after": null}"#;
+        for chunk in [1, 7, body.len()] {
+            let (entries, result) = parse_in_pieces(body, chunk);
+            assert!(result.is_ok(), "{chunk}: {result:?}");
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].path, "/a/b.txt");
+            assert_eq!(entries[0].modified.as_deref(), Some("2026-10-29T12:00:00Z"));
+            assert_eq!(entries[1].size, None);
+            assert!(entries[1].is_dir && entries[1].content_type.is_none());
+        }
+        let (_, empty) = parse_in_pieces(br#"{"list": null}"#, 4);
+        assert!(empty.is_ok());
+        let cut = body.windows(7).position(|w| w == b"\"a/c\", ").unwrap();
+        let (some, truncated) = parse_in_pieces(&body[..cut], 5);
+        assert_eq!(some.len(), 1, "what arrived before the cut is passed on");
+        assert!(
+            matches!(truncated, Err(ParseError::Json(_))),
+            "{truncated:?}"
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Big listings are parsed on the blocking pool as they arrive.
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 
 [dev-dependencies]
 base64.workspace = true

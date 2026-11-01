@@ -9,6 +9,8 @@
 # "pcloud"); $CONFIG picks another file. rclone defines the remote "pcloud" as an alias of what you
 # serve, so the config is the same as in the cluster. Dev secrets: INTERNAL_TOKEN=dev-internal-token
 # (what scripts/smoke-test.sh sends); RC_PASS is random per run. Both can be overridden from the env.
+# The pod's state directory (/var/lib/chance-of-files) becomes a scratch directory per run, so the
+# index works here too and starts empty each time; set $STATE_DIR to keep one between runs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,11 +25,19 @@ command -v rclone >/dev/null || { echo "rclone not found (mise use -g rclone)" >
 export INTERNAL_TOKEN=${INTERNAL_TOKEN:-dev-internal-token}
 export RC_PASS=${RC_PASS:-$(openssl rand -hex 32)}
 
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/chance-of-files-dev.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+state=${STATE_DIR:-$scratch/state}
+mkdir -p "$state"
+# The config with the pod's paths pointed at the scratch state directory.
+config=$scratch/config.toml
+sed "s|/var/lib/chance-of-files|$state|g" "${CONFIG:-deploy/k8s/base/config.toml}" >"$config"
+
 RCLONE_CONFIG=/dev/null RCLONE_CONFIG_PCLOUD_TYPE=alias RCLONE_CONFIG_PCLOUD_REMOTE="$src" \
   RCLONE_RC_USER=core RCLONE_RC_PASS="$RC_PASS" \
   rclone rcd --rc-addr=127.0.0.1:5572 --rc-serve --tpslimit=8 &
 rc=$!
-trap 'kill "$rc" 2>/dev/null || true' EXIT
+trap 'kill "$rc" 2>/dev/null || true; rm -rf "$scratch"' EXIT
 
-echo "serving $src; MCP at http://127.0.0.1:8080/mcp (Authorization: Bearer $INTERNAL_TOKEN)" >&2
-cargo run --bin chance-of-files -- --config "${CONFIG:-deploy/k8s/base/config.toml}"
+echo "serving $src; MCP at http://127.0.0.1:8080/mcp (Authorization: Bearer $INTERNAL_TOKEN); state in $state" >&2
+cargo run --bin chance-of-files -- --config "$config"

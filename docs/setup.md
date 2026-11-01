@@ -1,10 +1,10 @@
 # Setup
 
-Running your own Chance of Files 0.2, step by step: an rclone remote for your pCloud, a Cloudflare Tunnel and Workers VPC service, the core's pod on your own Kubernetes or k3s node, the auth Worker, then the connector in Claude. Allow about an hour.
+Running your own Chance of Files 0.3, step by step: an rclone remote for your pCloud, a Cloudflare Tunnel and Workers VPC service, the core's pod on your own Kubernetes or k3s node, the auth Worker, then the connector in Claude, and the index's first walk. Allow about an hour.
 
 Chance of Files is an independent project, not affiliated with pCloud or Anthropic; neither supports it, so problems go to this repository's issues, not to them.
 
-Upgrading from 0.1 (two Workers and a laptop)? See [Moving from 0.1](#moving-from-01) at the end. The 0.1 setup itself is at tag [`v0.1.0`](https://github.com/tywrr/chance-of-files/blob/v0.1.0/docs/setup.md).
+Upgrading from 0.2? See [From 0.2 to 0.3](#from-02-to-03). Upgrading from 0.1 (two Workers and a laptop)? See [Moving from 0.1](#moving-from-01) at the end. The 0.1 setup itself is at tag [`v0.1.0`](https://github.com/tywrr/chance-of-files/blob/v0.1.0/docs/setup.md).
 
 What you end up with:
 
@@ -29,8 +29,8 @@ And these files on your workstation, in `~/.config/chance-of-files/` (mode 700; 
 
 ## 1. Prerequisites
 
-- **A node that runs containers**, always on, with a few hundred MB of RAM free: a Kubernetes or k3s cluster you can reach with `kubectl` (a single-node k3s on a NAS or mini PC is the reference setup), or a plain Docker host ([Running on plain Docker](#running-on-plain-docker)). arm64 and amd64 both work.
-- **A default StorageClass** for the 50 Gi PVC (k3s ships `local-path`), or a PersistentVolume of your own (step 5).
+- **A node that runs containers**, always on, with about 1.5 GB of RAM free for walks of big folders (a few hundred MB at rest): a Kubernetes or k3s cluster you can reach with `kubectl` (a single-node k3s on a NAS or mini PC is the reference setup), or a plain Docker host ([Running on plain Docker](#running-on-plain-docker)). arm64 and amd64 both work.
+- **A default StorageClass** for the 50 Gi PVC (k3s ships `local-path`), or a PersistentVolume of your own (step 5). The index needs well under 1 GB of it (see [the first walk](#11-the-index-first-walk)).
 - **A Cloudflare account** on the free plan. Your `workers.dev` subdomain is shown under Workers & Pages.
 - **On your workstation:** `kubectl`, `rclone` 1.75 or later, `jq`, `openssl`, `git`, and [mise](https://mise.jdx.dev) (`mise install` in a clone of this repository brings node and wrangler). To build the image yourself: Rust from [rustup](https://rustup.rs) and Python 3; `deploy/build-image.sh` gets cargo-zigbuild and zig through mise. No Docker is needed.
 
@@ -92,11 +92,11 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: chance-of-files
 resources:
-  - https://github.com/tywrr/chance-of-files//deploy/k8s/base?ref=v0.2.0
+  - https://github.com/tywrr/chance-of-files//deploy/k8s/base?ref=v0.3.0
 images:
   - name: ghcr.io/tywrr/chance-of-files
     newName: localhost/chance-of-files     # the image you import in step 6
-    newTag: "0.2.0"
+    newTag: "0.3.0"
 configMapGenerator:
   - name: chance-of-files-config
     behavior: replace
@@ -111,15 +111,26 @@ Start `config.toml` from [`deploy/k8s/base/config.toml`](../deploy/k8s/base/conf
 hidden = ["/Crypto Folder", "/Taxes", "/.Trash-1000"]
 # Visible and readable, never written once write tools exist (0.4).
 protected = ["/Backups/Immich"]
-# search_files goes around these; Claude can still list and read them.
+# search_files leaves these out of its results; Claude can still list, read and audit them.
 search_skip = ["/Backups/Immich"]
+
+[index]
+# Where index.db lives: the data volume. Setting [server] state_dir = "/var/lib/chance-of-files"
+# instead does the same (and later versions keep more there). With neither, the index is off.
+dir = "/var/lib/chance-of-files/index"
+# Walked on their own schedules; roots never overlap (a parent's walk goes around a child root).
+roots = [
+  { path = "/", every = "30m" },
+  { path = "/Backups/Immich", every = "6h" },
+]
 ```
 
 - **Hide your Crypto Folder.** pCloud encrypts it client-side; there's no reason for Claude to see even its names. Hide anything else you wouldn't paste into a chat: IDs, tax papers, password exports.
-- **`search_skip` huge trees**, such as a photo backup with a hundred thousand files, so name searches stay fast.
+- **`search_skip` is optional now.** Name search answers from the index, so it's fast over the whole drive; skip a photo backup only if its hundred thousand file names would crowd out what you're looking for.
+- **Roots.** The default is one root, `/`, walked every 30 minutes. Give a huge tree that rarely changes, such as a photo backup, a root of its own with a longer `every`: each walk of `/` then goes around it, and it's walked on its own schedule.
 - **A guide.** Write an `/AGENTS.md` at the root of your drive saying what each folder is for; its first 8 KiB go into the instructions Claude gets when it connects (`guide.path`).
 
-**Storage.** The base asks the default StorageClass for 50 Gi; 0.2 writes almost nothing there, but later releases keep the index and mirror on it. To use a directory you choose on the node, add a `local` PersistentVolume with a `nodeAffinity` for your node and a patch that sets the PVC's `storageClassName` and `volumeName` to it. Make the directory owned by `65532:65532`, the user every container runs as. `hostPath` volumes are refused by the namespace's `restricted` Pod Security profile.
+**Storage.** The base asks the default StorageClass for 50 Gi, mounted at `/var/lib/chance-of-files`; 0.3 keeps `index/index.db` there (tens of MB for a drive of ~140,000 entries; `index_status` shows its size), and later releases add the mirror and upload staging. To use a directory you choose on the node, add a `local` PersistentVolume with a `nodeAffinity` for your node and a patch that sets the PVC's `storageClassName` and `volumeName` to it. Make the directory owned by `65532:65532`, the user every container runs as. `hostPath` volumes are refused by the namespace's `restricted` Pod Security profile.
 
 ## 6. Build the image
 
@@ -199,9 +210,9 @@ On claude.ai (or in the desktop app):
 1. Open **Customize > Connectors** and select **Add custom connector**.
 2. Name: `pCloud`. URL: `https://chance-of-files.<subdomain>.workers.dev/mcp`, exactly, with no trailing slash.
 3. Leave the OAuth client ID and secret empty. If the dialog asks how Claude identifies itself, choose **Use Claude's published identity** (CIMD).
-4. Select **Add**, then **Connect**. Your Worker's sign-in page opens: enter the passphrase. Leave **Also allow changes** unticked: 0.2 has no write tools, and a read-only grant is the safer default. Approve; you land back in claude.ai and the connector shows **Connected**.
+4. Select **Add**, then **Connect**. Your Worker's sign-in page opens: enter the passphrase. Leave **Also allow changes** unticked: 0.3 has no write tools, and a read-only grant is the safer default. Approve; you land back in claude.ai and the connector shows **Connected**.
 
-The connector's page should list `list_folder`, `get_file_info`, `read_text_file`, `read_image` and `search_files`, all read-only. Try it in a chat: **+ > Connectors**, turn on pCloud, and ask "What's in the top folder of my pCloud?".
+The connector's page should list `list_folder`, `get_file_info`, `read_text_file`, `read_image`, `search_files`, `folder_stats`, `query_files`, `find_duplicates`, `recent_changes`, `type_breakdown`, `index_status` and `refresh_index`, all read-only. Try it in a chat: **+ > Connectors**, turn on pCloud, and ask "What's in the top folder of my pCloud?".
 
 For Claude Code:
 
@@ -214,6 +225,20 @@ then run `/mcp` in Claude Code to sign in.
 ## 10. Check it in Claude Duet
 
 Duet uses the connectors on your claude.ai account; there's nothing to add. Ask it something like "Read notes/todo.md from pCloud and summarize it". Duet is a research preview: it uses custom connectors when you talk to it, but its scheduled and background runs may not.
+
+## 11. The index: first walk
+
+The core starts walking when it starts, one root at a time. Until a root's first walk has finished, index results say so in their header (`list_folder live=true` and `get_file_info` ask pCloud directly in the meantime). The listing part is quick, ~4 s for `/` around a photo backup and ~6 s for a 133k-file folder ([phase 0](design/phase0-rclone.md)); writing the entries into SQLite takes longer on the first walk than on later ones, which only apply the differences.
+
+Ask Claude "What's the index status?", or call `index_status` yourself (as in step 7, with `"method":"tools/call","params":{"name":"index_status","arguments":{}}`). Per root you get when the last walk started and finished, how many entries it holds, the last error and any held removal; then the backend's health.
+
+Then try the audit questions: "Which folders take the most space?", "What are my 20 largest files?", "Do I have duplicate videos over 100 MB?", "What changed in my drive this week?".
+
+**When a walk would remove a lot.** If one walk of a root would remove more than `index.max_removal` (5%) of its entries, the core applies the walk's adds and changes but holds the removals, and `index_status` says so: "walk of / at 14:05Z would remove 7,412 entries (6.1%)". That protects the index from a truncated or flaky listing. If you did delete or move that much (check in pCloud's web UI), apply it: ask Claude to run `refresh_index` with `path` set to the root and `confirm=true`. If you didn't, leave it: the entries stay in the index, and `refresh_index` without `confirm` re-walks to check.
+
+**Refreshing by hand.** `refresh_index` with a `path` re-walks the root that contains it and returns at once; `index_status` shows progress. Use it after big changes made outside Claude, instead of waiting for the next scheduled walk.
+
+**Starting over.** The index is a cache. To rebuild it, stop the pod, delete `index/index.db` (and its `-wal` and `-shm` files) from the volume, and start the pod; the first walk rebuilds it.
 
 ## Running on plain Docker
 
@@ -234,7 +259,7 @@ docker run -d --name cof-rclone --restart unless-stopped --env-file /etc/chance-
   rclone/rclone:1.75.2 rcd --rc-addr=127.0.0.1:5572 --rc-serve --tpslimit=8
 docker run -d --name cof-core --restart unless-stopped --network container:cof-rclone --env-file /etc/chance-of-files/env \
   -v /etc/chance-of-files/config.toml:/etc/chance-of-files/config.toml:ro -v cof-data:/var/lib/chance-of-files \
-  localhost/chance-of-files:0.2.0
+  localhost/chance-of-files:0.3.0
 docker run -d --name cof-cloudflared --restart unless-stopped --network container:cof-rclone --env-file /etc/chance-of-files/env \
   cloudflare/cloudflared:2026.10.2 tunnel --no-autoupdate --protocol quic run
 ```
@@ -269,9 +294,15 @@ The tunnel has no connector, or the VPC service points somewhere else. Check tha
 
 cloudflared needs outbound UDP 7844 (QUIC). The NetworkPolicy allows it; a firewall in front of the node might not. Workers VPC doesn't work over http2, so the base pins `--protocol quic`.
 
+### Index results look stale, or `index_status` shows an error
+
+Each result header says when its root was last walked. If that's older than its `every` plus a few minutes, look at `index_status`: `last_error` is the walk's failure, and `backend unhealthy since …` means rclone or pCloud isn't answering (see the previous section). A held mass removal doesn't stop walks; it only holds removals until you confirm ([the first walk](#11-the-index-first-walk)). The core's log has the walks too: `kubectl -n chance-of-files logs deploy/chance-of-files -c core | grep -i walk`.
+
+If the core restarts during a walk, look at `kubectl -n chance-of-files describe pod` for `OOMKilled`: raise the core's memory limit in your overlay (the base sets 2 Gi).
+
 ### A path Claude should see says "not found"
 
-It's under a `policy.hidden` entry (hidden paths answer "not found" on purpose), or its case or Unicode form differs from what you typed: compare with `list_folder` on its parent.
+It's under a `policy.hidden` entry (hidden paths answer "not found" on purpose), or its case or Unicode form differs from what you typed: compare with `list_folder` on its parent. If it's new, the index may not have seen it yet: `list_folder` with `live=true` and `get_file_info` ask pCloud directly, and `refresh_index` re-walks.
 
 ### Sign-in succeeds, but the card stays on Connect or the tools never appear
 
@@ -286,6 +317,15 @@ deploy/build-image.sh --import <node>         # the new version's image
 deploy/k8s/apply.sh my-overlay
 mise run deploy:auth
 ```
+
+### From 0.2 to 0.3
+
+0.3 adds the index; nothing else changes in how you deploy it.
+
+1. **Give the index a directory**, or it stays off. Your overlay replaces the base's whole `config.toml`, so the base's new `state_dir` doesn't reach you: add `state_dir = "/var/lib/chance-of-files"` under `[server]` (the data volume; the index then lives in `index/` there), or set `[index].dir`. With neither, 0.3 runs as 0.2 did, without the index or the audit tools, and logs a warning at startup. Then, optionally, an `[index]` section (step 5); its keys are `enabled` (`true`), `dir` (`<server.state_dir>/index`), `max_removal` (`0.05`), `hash_min_size` (`1048576`, bytes), `hash_in_background` (`true`) and `roots` (default: one root, `/`, every 30 minutes). `[rclone]` gains `health_every` (`5m`), how often rclone and pCloud are checked.
+2. Reconsider `policy.search_skip`: name search now covers the whole drive from the index, so it's no longer needed for speed.
+3. Bump `ref=v0.3.0` and `newTag: "0.3.0"`, build and import the image, and apply as above. The first walk starts with the pod; watch it with `index_status` ([step 11](#11-the-index-first-walk)).
+4. Reconnect in Claude, or **⋯ > Refresh tool list** on the connector, so it picks up the new tools (Claude caches the tool list for a few minutes).
 
 ## Rotating secrets
 
@@ -307,7 +347,7 @@ mise run deploy:auth
 
 ## Moving from 0.1
 
-0.1 ran two Workers (`chance-of-files` and `chance-of-files-core`) and rclone + cloudflared on a laptop or in a pod, on a tunnel and VPC service of their own. 0.2 is built to run **next to** it, so you can switch over without downtime:
+0.1 ran two Workers (`chance-of-files` and `chance-of-files-core`) and rclone + cloudflared on a laptop or in a pod, on a tunnel and VPC service of their own. 0.2 and later are built to run **next to** it, so you can switch over without downtime:
 
 1. Create a **new** tunnel and VPC service for 0.2 (steps 3 and 4); leave the old ones alone.
 2. Deploy the pod (steps 5–7). If your 0.1 backend ran on Kubernetes, it's in the same namespace, `chance-of-files`, but under other names (`chance-of-files-backend`), so both run side by side, each on its own tunnel.

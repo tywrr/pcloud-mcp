@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 chance-of-files-core.workspace = true
+chance-of-files-index.workspace = true
 chance-of-files-rclone.workspace = true
 axum.workspace = true
 serde.workspace = true

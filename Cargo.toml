@@ -1,19 +1,20 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/rclone", "crates/server"]
+members = ["crates/core", "crates/index", "crates/rclone", "crates/server"]
 # Throwaway measurement tools (docs/design/v2.md, phase 0), each its own Cargo project.
 # crates/webdav is parked: it was written for Workers (single-threaded, non-Send futures, a
 # per-request CPU budget) and gets ported to the Send storage traits when it gains writes.
 exclude = ["spikes", "crates/webdav"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tywrr/chance-of-files"
 
 [workspace.dependencies]
 chance-of-files-core = { path = "crates/core" }
+chance-of-files-index = { path = "crates/index" }
 chance-of-files-rclone = { path = "crates/rclone" }
 
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
@@ -39,3 +40,7 @@ trait-variant = "0.1.2"
 codegen-units = 4
 lto = "thin"
 strip = true
+
+# SQLite's C code is slow unoptimised, and the index tests walk 150k entries.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

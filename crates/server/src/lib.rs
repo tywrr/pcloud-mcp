@@ -18,11 +18,53 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
-use chance_of_files_core::{HttpRequest, McpServer, SCOPES_HEADER, Scopes, Storage};
+use chance_of_files_core::{Health, HttpRequest, McpServer, SCOPES_HEADER, Scopes, Storage};
 use subtle::ConstantTimeEq;
 
 /// How long a readiness probe waits for rclone.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one health check waits.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often a failing backend is checked again.
+const UNHEALTHY_EVERY: Duration = Duration::from_secs(30);
+
+/// Checks the backend every `every` (every 30 s while it fails), and right away when a call
+/// reports a backend error, and keeps `health` up to date for the tools and the indexer.
+pub async fn health_loop<S: Storage>(storage: S, health: Arc<Health>, every: Duration) {
+    loop {
+        let result = match tokio::time::timeout(HEALTH_TIMEOUT, storage.health()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err(format!("no answer within {} s", HEALTH_TIMEOUT.as_secs())),
+        };
+        match result {
+            Ok(()) => {
+                if let Some(was) = health.status() {
+                    tracing::info!(since = was.since, "storage backend healthy again");
+                }
+                health.set_ok();
+            }
+            Err(error) => {
+                if health.is_healthy() {
+                    tracing::warn!(error = %error, "storage backend unhealthy");
+                }
+                health.set_failed(&error);
+            }
+        }
+        let wait = if health.is_healthy() {
+            every
+        } else {
+            every.min(UNHEALTHY_EVERY)
+        };
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {},
+            () = health.poked() => {
+                // A burst of failing calls asks many times; one check is enough.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            },
+        }
+    }
+}
 
 pub struct App<S: Storage> {
     pub mcp: McpServer<S>,
