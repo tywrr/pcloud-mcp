@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { grantedScopes } from "../src/config";
 import {
 	type Echo,
+	ORIGIN,
 	PASSPHRASE,
 	authorizeUrl,
 	call,
@@ -135,17 +136,21 @@ describe("granted scopes", () => {
 });
 
 describe("headers to the core", () => {
-	it("strips every client-sent X-CoF-* header and sets X-CoF-Scopes from the grant", async () => {
+	it("strips every client-sent X-CoF-* header and sets X-CoF-Scopes and X-CoF-Public-Url", async () => {
 		const { tokens } = await signIn();
 		const headers = await forwardedHeaders(tokens.access_token, {
 			"X-CoF-Scopes": "files:read files:write",
+			"X-CoF-Public-Url": "https://evil.example",
 			"x-cof-client-ip": "203.0.113.9",
 			"X-COF-Anything": "1",
 			"X-Other": "kept",
 		});
-		const cof = Object.keys(headers).filter((name) => name.startsWith("x-cof-"));
-		expect(cof).toEqual(["x-cof-scopes"]);
+		const cof = Object.keys(headers)
+			.filter((name) => name.startsWith("x-cof-"))
+			.sort();
+		expect(cof).toEqual(["x-cof-public-url", "x-cof-scopes"]);
 		expect(headers["x-cof-scopes"]).toBe("files:read");
+		expect(headers["x-cof-public-url"]).toBe(ORIGIN);
 		expect(headers["x-other"]).toBe("kept");
 	});
 

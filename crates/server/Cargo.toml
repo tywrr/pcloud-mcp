@@ -16,15 +16,24 @@ chance-of-files-core.workspace = true
 chance-of-files-index.workspace = true
 chance-of-files-rclone.workspace = true
 axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+# state.db: links, jobs and the audit log.
+rusqlite.workspace = true
+# Free space on the staging volume (statvfs).
+rustix = { version = "1.1.6", default-features = false, features = ["fs", "std"] }
 serde.workspace = true
 serde_json.workspace = true
+# SHA-1 of a finished upload, checked against pCloud's.
+sha1.workspace = true
 serde_ignored = "0.1.14"
 subtle.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
 
 [dev-dependencies]
+chance-of-files-core = { workspace = true, features = ["testing"] }
 http-body-util.workspace = true
 tower = { version = "0.5.3", default-features = false, features = ["util"] }

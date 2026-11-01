@@ -17,8 +17,8 @@ mod query;
 use std::sync::{Arc, Mutex};
 
 use chance_of_files_core::{
-    Change, Filter, HashKind, Health, HeldRemoval, Index, IndexError, IndexResult, IndexStatus,
-    IndexedEntry, Policy, RootStatus, SizeGroups, Sort, Storage, TypeRow, fold, time,
+    Change, Entry, Filter, HashKind, Health, HeldRemoval, Index, IndexError, IndexResult,
+    IndexStatus, IndexedEntry, Policy, RootStatus, SizeGroups, Sort, Storage, TypeRow, fold, time,
 };
 use tokio::sync::Notify;
 
@@ -337,6 +337,30 @@ impl Index for IndexHandle {
 
     fn store_hashes(&self, entry: &IndexedEntry, hashes: &[(HashKind, String)]) -> IndexResult<()> {
         query::store_hashes(&self.shared.db.writer(), entry, hashes)
+    }
+
+    fn record_write(&self, entry: &Entry) -> IndexResult<()> {
+        if !self.shared.policy.visible(&entry.path)
+            || self.shared.root_holding(&entry.path).is_none()
+        {
+            return Ok(());
+        }
+        self.record_own_write(&WalkRow::from(entry.clone()))
+    }
+
+    fn record_delete(&self, path: &str) -> IndexResult<()> {
+        let stored = query::stored_path(&*self.reader()?, path)?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        self.record_own_delete(&stored).map(|_| ())
+    }
+
+    fn rewalk(&self, path: &str) -> IndexResult<()> {
+        if self.shared.root_covering(path).is_none() {
+            return Ok(());
+        }
+        self.refresh(Some(path), false).map(|_| ())
     }
 
     fn refresh(&self, path: Option<&str>, confirm: bool) -> IndexResult<String> {

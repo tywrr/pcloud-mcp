@@ -8,6 +8,8 @@
 #   internal-token   the auth Worker's INTERNAL_TOKEN; the core refuses /mcp without it
 #   rc-pass          rclone's rc password. It is root-equivalent inside the rclone container
 #                    (--rc-serve also serves local paths), so it never leaves the pod
+#   link-key         signs download and upload links (the auth Worker's LINK_KEY too); optional
+#                    here so a Secret from before 0.4 still starts the pod, with links off
 #   pcloud-token, pcloud-hostname   from an authorised rclone pcloud remote (`rclone config dump`)
 #   tunnel-token     the tunnel's eyJ... token
 #
@@ -54,6 +56,8 @@ spec:
               valueFrom: { secretKeyRef: { name: chance-of-files, key: internal-token } }
             - name: RC_PASS
               valueFrom: { secretKeyRef: { name: chance-of-files, key: rc-pass } }
+            - name: LINK_KEY
+              valueFrom: { secretKeyRef: { name: chance-of-files, key: link-key, optional: true } }
           volumeMounts:
             - { name: config, mountPath: /etc/chance-of-files, readOnly: true }
             - { name: data, mountPath: /var/lib/chance-of-files }
@@ -74,11 +78,14 @@ spec:
           # No --filter-from and no other filter, ever: a directory filter turns off pCloud's
           # recursive listing and server-side folder moves, and filters don't stop single-object
           # calls anyway. The core's policy is what hides paths (docs/design/phase0-rclone.md).
+          # Finished async jobs are kept an hour (default: a minute), so a core restart doesn't
+          # turn a job that ended meanwhile into "lost".
           args:
             - rcd
             - --rc-addr=127.0.0.1:5572
             - --rc-serve
             - --tpslimit=8
+            - --rc-job-expire-duration=1h
           env:
             # rclone reads any flag from RCLONE_<FLAG>, so the password stays out of the args (and ps).
             - { name: RCLONE_RC_USER, value: core }
@@ -94,6 +101,12 @@ spec:
               valueFrom: { secretKeyRef: { name: chance-of-files, key: pcloud-token } }
           volumeMounts:
             - { name: rclone-tmp, mountPath: /tmp }
+            # Uploads reach pCloud by operations/copyfile from the core's staging folder, so rclone
+            # sees the data volume at the same path, read-only. (pCloud has no streaming upload:
+            # anything else would spool whole files into rclone's small /tmp.) A subPath mount of
+            # just staging/ would race the core creating it, and RC_PASS can read this container's
+            # files anyway, so the whole volume is no wider exposure.
+            - { name: data, mountPath: /var/lib/chance-of-files, readOnly: true }
           resources:
             # Measured peaks: idle 84 MB, a recursive listing of 133k entries ~440 MB. The core's
             # walks run one at a time, so 1 Gi leaves about 2x headroom.

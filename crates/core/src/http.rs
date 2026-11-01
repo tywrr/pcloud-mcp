@@ -13,6 +13,9 @@ pub struct HttpRequest {
     /// What the client may do. Set by the server from a header it trusts only after
     /// authenticating the request; the core never reads scopes from `headers` itself.
     pub scopes: Scopes,
+    /// The auth Worker's public origin (`X-CoF-Public-Url`), set like `scopes`; link URLs
+    /// start with it.
+    pub public_url: Option<String>,
 }
 
 impl HttpRequest {

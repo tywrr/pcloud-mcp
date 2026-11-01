@@ -4,12 +4,14 @@ The public half of Chance of Files: a TypeScript Worker named `chance-of-files` 
 
 | Path | What it does |
 |---|---|
-| `/mcp` | Needs `Authorization: Bearer <access token>`, else `401` with `WWW-Authenticate: Bearer … resource_metadata="…", scope="files:read"`. Forwarded to the core with `Authorization: Bearer <INTERNAL_TOKEN>`, `X-CoF-Scopes`, no `Cookie` and no client-sent `X-CoF-*` header; the core's response comes back unchanged. A token without `files:read` (refreshed down to less) gets `403 insufficient_scope` |
+| `/mcp` | Needs `Authorization: Bearer <access token>`, else `401` with `WWW-Authenticate: Bearer … resource_metadata="…", scope="files:read"`. Forwarded to the core with `Authorization: Bearer <INTERNAL_TOKEN>`, `X-CoF-Scopes`, `X-CoF-Public-Url`, no `Cookie` and no client-sent `X-CoF-*` header; the core's response comes back unchanged. A token without `files:read` (refreshed down to less) gets `403 insufficient_scope` |
 | `/authorize` | The sign-in page: who is asking, where access goes, the write checkbox, a passphrase field |
 | `/token` | Code exchange, refresh, revocation, for public clients and DCR clients with a secret. Client assertions (`private_key_jwt`) get `401 invalid_client` |
 | `/register` | Dynamic Client Registration (RFC 7591), only from the addresses in `DCR_ALLOWED_CIDRS`; others get `403` |
 | `/.well-known/oauth-authorization-server` | RFC 8414 metadata |
 | `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-protected-resource` | RFC 9728 metadata; `resource` is `<origin>/mcp` |
+| `/dl/<token>/<name>` | A signed download link (`GET`, `HEAD`, with `Range`), no OAuth. See [Links](#links) |
+| `/ul/<token>` | A signed upload link: `PUT` one part (≤ 90 MiB, with `Content-Length` and `Content-Range`), `HEAD` for the committed offset. See [Links](#links) |
 | `/healthz` | `ok`, without auth |
 
 Everything else is `404`.
@@ -39,19 +41,31 @@ Everything else is `404`.
 - **Tokens.** Access tokens last 1 hour. Refresh tokens rotate on every use; a grant lasts 30 days and each refresh extends it by 30 days. Tokens are stored in KV only as hashes.
 - **Discovery.** Client ID Metadata Documents (needs the `global_fetch_strictly_public` compatibility flag) and Dynamic Client Registration are both on, and `none` is among the token endpoint auth methods, which is what Claude needs to pick CIMD.
 
+## Links
+
+`create_download_link` and `create_upload_link` (core, 0.4) return URLs on this Worker, so a client that holds no OAuth token, such as Duet's computer with `curl`, can move files bigger than a tool result. The token in the path is the credential: `<id>.<exp>.<mac>`, where `id` is 128 random bits, `exp` the expiry in Unix seconds and `mac` the first 128 bits of HMAC-SHA256 with `LINK_KEY` (its UTF-8 bytes) over `"<kind>.<id>.<exp>"`, where `kind` is `dl` or `ul`; `id` and `mac` are unpadded base64url. The core mints and owns links; this Worker only pre-checks them, so junk never reaches the cluster.
+
+- **Checks here, in order:** method (`GET`/`HEAD` on `/dl`, `PUT`/`HEAD` on `/ul`, else `405`), `LINK_LIMITER` (60 requests a minute per IP or IPv6 /64, else `429`), token shape (`404`), MAC in constant time (`403`; the kind is signed, so an upload token is no download link), expiry (`410`). For a `PUT`: `Content-Length` is required (`411`) and at most 90 MiB (`413`), and a `Content-Range` must span exactly that many bytes (`413` if wider than 90 MiB, `400` if it disagrees). Cloudflare caps request bodies at 100 MB on the free plan, so parts of 90 MiB are the only way to upload.
+- **Checks in the core** (authoritative): the link's row (revoked, used up, completed), the `/24` (`/64`) binding to the first client, the per-link byte cap, ranges against the real size (`416`), upload offsets and the final size and hash.
+- **What the core sees:** the request as sent, with `Authorization: Bearer <INTERNAL_TOKEN>`, `X-CoF-Client-IP` set to `CF-Connecting-IP`, and no cookies or client-sent `X-CoF-*` headers. Bodies stream both ways; nothing is buffered, so a 2 GiB download or a 90 MiB part costs the Worker almost no CPU.
+- **Download headers.** Links share this origin with the sign-in page, so every link response gets `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox; …`, `X-Frame-Options: DENY`, `Cache-Control: no-store` and `Referrer-Policy: no-referrer`, and successful downloads are always `Content-Disposition: attachment` (the core's, or one built from `<name>`) with `application/octet-stream` (or `application/zip`). Cookies from the core are dropped.
+
+`LINK_KEY` must be the same on the Worker and the core. Changing it on both revokes every link at once.
+
 ## Configuration
 
 | Name | Kind | Meaning |
 |---|---|---|
 | `INTERNAL_TOKEN` | secret | Same value as the core's `INTERNAL_TOKEN` (the `internal-token` key of the cluster Secret) |
 | `OWNER_PASSPHRASE` | secret | The sign-in passphrase (12+ characters) |
+| `LINK_KEY` | secret | The HMAC key of `/dl` and `/ul` links; the same value as the core's `LINK_KEY` (in the cluster Secret). At least 32 characters, random, for example `openssl rand -base64 32`. Without it (or shorter) links answer `503` |
 | `PUBLIC_URL` | var | Public origin, for example `https://chance-of-files.example.workers.dev`. Empty (default) uses the origin each request arrives on. When set, requests on any other hostname get `421` |
 | `ALLOWED_REDIRECT_URIS` | var | Comma-separated exact redirect URIs, plus `loopback` for the loopback rule. Empty means the defaults |
 | `DCR_ALLOWED_CIDRS` | var | Who may call `POST /register`: comma-separated IPv4 or IPv6 CIDRs (a bare address is one host), matched against `CF-Connecting-IP`, or `*` for everyone. Empty means the default, `127.0.0.0/8,::1`. Add `160.79.104.0/21` (Anthropic) only if claude.ai falls back to DCR. Claude Code doesn't need it, since it identifies itself with its own metadata document. A client on your own computer that does use DCR, such as the MCP Inspector, registers from your own address: add it for the moment you connect the client, or use `*` and change it back |
 | `CORE_URL` | var | Local development only: a loopback origin such as `http://127.0.0.1:8080` to send `/mcp` to a core on this computer instead of `CORE`. Anything but a loopback `http` origin is refused with `500`, and a deployed Worker can't reach loopback anyway. Empty by default; set it in `.dev.vars` |
 | `OAUTH_KV` | KV | Clients, grants, tokens. Created on the first deploy |
 | `CORE` | VPC service | The core, through the Workers VPC service that points at `127.0.0.1:8080` over your tunnel. `service_id` is a `<SERVICE_ID>` placeholder in `wrangler.jsonc`; the real one goes in `wrangler.personal.jsonc` |
-| `PASSPHRASE_LIMITER`, `SIGNIN_LIMITER` | rate limit | See above; `namespace_id` must be unique in your account |
+| `PASSPHRASE_LIMITER`, `SIGNIN_LIMITER`, `LINK_LIMITER` | rate limit | See above and [Links](#links); `namespace_id` must be unique in your account |
 
 The `resource` in the protected-resource metadata is `<public origin>/mcp`, and it must equal the URL you enter in Claude exactly, so add the connector as `https://<your worker host>/mcp`.
 
@@ -86,9 +100,11 @@ Then, from `auth/`, with the core running in the cluster:
 npx wrangler login
 # A new Worker can't hold secrets before its first deploy, and wrangler refuses to deploy
 # without the required ones, so the first deploy passes them in a file it reads once:
-npx wrangler deploy -c wrangler.personal.jsonc --secrets-file <(printf 'INTERNAL_TOKEN=%s\nOWNER_PASSPHRASE=%s\n' "$INTERNAL_TOKEN" "$OWNER_PASSPHRASE")
+npx wrangler deploy -c wrangler.personal.jsonc --secrets-file <(printf 'INTERNAL_TOKEN=%s\nOWNER_PASSPHRASE=%s\nLINK_KEY=%s\n' "$INTERNAL_TOKEN" "$OWNER_PASSPHRASE" "$LINK_KEY")
 # Later changes:
 npx wrangler secret put OWNER_PASSPHRASE -c wrangler.personal.jsonc
+# Upgrading a Worker deployed before 0.4: add LINK_KEY (the core's value) before deploying.
+npx wrangler secret put LINK_KEY -c wrangler.personal.jsonc
 npm run deploy       # wrangler deploy -c wrangler.personal.jsonc
 ```
 

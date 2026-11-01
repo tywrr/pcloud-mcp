@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use chance_of_files_core::{ByteRange, Policy, Storage, StorageError, read_capped};
+use chance_of_files_core::{
+    ByteRange, Done, JobId, JobState, Policy, Storage, StorageError, StorageWrite, read_capped,
+};
 use chance_of_files_rclone::{RcloneConfig, RcloneStorage};
 use tokio::process::{Child, Command};
 
@@ -39,6 +41,15 @@ struct Rcd {
 
 /// Starts `rclone rcd` on a free port with a random rc password and waits until it answers.
 async fn start(remote: &str, dir: Option<&Path>, envs: &[(&str, &str)]) -> Rcd {
+    start_staged(remote, dir, envs, None).await
+}
+
+async fn start_staged(
+    remote: &str,
+    dir: Option<&Path>,
+    envs: &[(&str, &str)],
+    staging: Option<PathBuf>,
+) -> Rcd {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -71,6 +82,7 @@ async fn start(remote: &str, dir: Option<&Path>, envs: &[(&str, &str)]) -> Rcd {
         password,
         remote: remote.into(),
         max_listing_bytes: 64_000_000,
+        staging,
     })
     .unwrap();
     for _ in 0..100 {
@@ -329,4 +341,114 @@ async fn pcloud_remote_read_only() {
             .count(),
         split.len()
     );
+}
+
+/// Waits for an rclone job to end.
+async fn finished(storage: &RcloneStorage, done: Done) -> JobState {
+    let Done::Job(id) = done else {
+        panic!("expected a job, got {done:?}");
+    };
+    for _ in 0..100 {
+        let info = storage.job(&id).await.unwrap();
+        assert!(info.started.is_some());
+        if info.state != JobState::Running {
+            return info.state;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("job {id} didn't finish");
+}
+
+#[tokio::test]
+async fn local_remote_writes() {
+    if !rclone_available() {
+        eprintln!("skipped: rclone is not installed");
+        return;
+    }
+    let dir = scratch();
+    let staging =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("rcd-staging-{}", random_password()));
+    std::fs::create_dir_all(&staging).unwrap();
+    let rcd = start_staged(
+        "cofscratch",
+        Some(&dir),
+        &[("RCLONE_CONFIG_COFSCRATCH_TYPE", "local")],
+        Some(staging.clone()),
+    )
+    .await;
+    let s = &rcd.storage;
+    let policy = Policy::default();
+    let p = |path: &str| policy.check(path).unwrap();
+    let caps = s.load_capabilities().await.unwrap();
+    assert!(!caps.trash_on_delete, "a local remote deletes for good");
+
+    let made = s.mkdir(&p("/new/deep")).await.unwrap();
+    assert!(made.is_dir && dir.join("new/deep").is_dir());
+    let written = s
+        .put_bytes(bytes::Bytes::from_static(b"hello"), &p("/new/deep/x b.txt"))
+        .await
+        .unwrap();
+    assert_eq!(written.size, Some(5));
+    assert_eq!(
+        std::fs::read(dir.join("new/deep/x b.txt")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        std::fs::read_dir(&staging).unwrap().count(),
+        0,
+        "temp file removed"
+    );
+
+    // Files move and copy at once.
+    let Done::Now(moved) = s
+        .rename(&p("/new/deep/x b.txt"), &p("/new/y.txt"))
+        .await
+        .unwrap()
+    else {
+        panic!("a file move is immediate");
+    };
+    assert_eq!(moved.path, "/new/y.txt");
+    assert!(!dir.join("new/deep/x b.txt").exists());
+    assert!(matches!(
+        s.copy(&p("/new/y.txt"), &p("/new/deep/z.txt"))
+            .await
+            .unwrap(),
+        Done::Now(_)
+    ));
+
+    // Folders are jobs.
+    let job = s.copy(&p("/new"), &p("/copied")).await.unwrap();
+    assert_eq!(finished(s, job).await, JobState::Done);
+    assert_eq!(
+        std::fs::read(dir.join("copied/deep/z.txt")).unwrap(),
+        b"hello"
+    );
+    let job = s.rename(&p("/copied"), &p("/renamed")).await.unwrap();
+    assert_eq!(finished(s, job).await, JobState::Done);
+    assert!(dir.join("renamed/y.txt").exists() && !dir.join("copied").exists());
+
+    // Uploads come from the staging folder only.
+    std::fs::write(staging.join("up.part"), b"uploaded").unwrap();
+    let up = s
+        .put_local(&staging.join("up.part"), &p("/renamed/up.bin"))
+        .await
+        .unwrap();
+    assert_eq!(up.size, Some(8));
+    let outside = dir.join("notes/todo.md");
+    assert!(matches!(
+        s.put_local(&outside, &p("/stolen.md")).await,
+        Err(StorageError::InvalidPath(_))
+    ));
+
+    // No trash here, so nothing is deleted.
+    assert!(matches!(
+        s.trash(&p("/renamed/y.txt")).await,
+        Err(StorageError::Unsupported(_))
+    ));
+    assert!(dir.join("renamed/y.txt").exists());
+    assert_eq!(
+        s.job(&JobId("987654".into())).await.unwrap().state,
+        JobState::Lost
+    );
+    let _ = std::fs::remove_dir_all(&staging);
 }

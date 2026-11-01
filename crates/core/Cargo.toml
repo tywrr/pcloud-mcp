@@ -9,16 +9,30 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+# CRC-32 of streamed zip entries.
+crc32fast.workspace = true
 futures-util.workspace = true
+# Link ids; signed with HMAC-SHA256 under LINK_KEY.
+getrandom.workspace = true
+hmac.workspace = true
 # NFD for case- and accent-insensitive name matching and path policy.
 icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
+percent-encoding.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1 = { workspace = true, optional = true }
+sha2.workspace = true
+subtle.workspace = true
 # Deadlines on storage calls and index queries on the blocking pool; the caller provides the
 # runtime.
 tokio = { workspace = true, features = ["rt", "sync"] }
 trait-variant.workspace = true
 
+[features]
+# MemoryStore and MemoryState, for tests here and in the crates that build on this one.
+testing = ["dep:sha1"]
+
 [dev-dependencies]
+chance-of-files-core = { path = ".", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -141,6 +141,9 @@ impl MemoryStorage {
     }
 }
 
+/// Read-only.
+impl chance_of_files_core::StorageWrite for MemoryStorage {}
+
 impl Storage for MemoryStorage {
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()

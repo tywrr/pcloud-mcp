@@ -19,11 +19,12 @@ Working on Chance of Files locally: the server and a local `rclone rcd` run on y
 
 | Path | Crate or package | What |
 |---|---|---|
-| `crates/core` | `chance-of-files-core` | The MCP endpoint (Streamable HTTP, stateless), JSON-RPC dispatch, the tools, the `Storage` trait, `Policy`, scopes. No I/O, so its tests run against an in-memory store |
+| `crates/core` | `chance-of-files-core` | The MCP endpoint (Streamable HTTP, stateless), JSON-RPC dispatch, the tools, the `Storage` and `StorageWrite` traits, `Policy` (hidden and protected), scopes. No I/O, so its tests run against an in-memory store with a trash |
 | `crates/rclone` | | `Storage` over rclone's remote-control API |
 | `crates/webdav` | `chance-of-files-webdav` | `Storage` over WebDAV, for a local folder or NAS |
-| `crates/server` | binary `chance-of-files` | axum on tokio: config file, internal token and scopes, `/mcp`, `/healthz`, `/readyz` |
-| `auth/` | `chance-of-files-auth` (npm) | The TypeScript Worker `chance-of-files`: OAuth and the `/mcp` proxy over the `CORE` VPC binding |
+| `crates/index` | | The metadata index (`index.db`) and, from 0.4, `state.db`: links, `link_log`, jobs, the write audit log |
+| `crates/server` | binary `chance-of-files` | axum on tokio: config file, internal token and scopes, `/mcp`, `/dl` and `/ul` (links), background walks and jobs, `/healthz`, `/readyz` |
+| `auth/` | `chance-of-files-auth` (npm) | The TypeScript Worker `chance-of-files`: OAuth, the `/mcp` proxy and the `/dl` and `/ul` link routes (HMAC and expiry pre-check, rate limit) over the `CORE` VPC binding |
 | `deploy/k8s/base/` | | The kustomize base: Namespace, Deployment, ConfigMap from `config.toml`, PVC, NetworkPolicy |
 | `deploy/k8s/apply.sh` | | Secret from local files, `kubectl apply -k`, rollout, tunnel and `/readyz` checks |
 | `deploy/build-image.sh`, `deploy/oci-image.py` | | Static musl binary → OCI archive → optional `k3s ctr images import` over ssh |
@@ -65,7 +66,30 @@ curl -s "${H[@]}" http://127.0.0.1:8080/mcp -d '{"jsonrpc":"2.0","id":4,"method"
 curl -si http://127.0.0.1:8080/mcp -d '{}' | head -1    # 401 without the token
 ```
 
-The endpoint is stateless, so `tools/list` works without `initialize` first. Without `X-CoF-Scopes` a request has `files:read` only; in 0.2 both `tools/list` calls above show the same five tools.
+The endpoint is stateless, so `tools/list` works without `initialize` first. Without `X-CoF-Scopes` a request has `files:read` only, so the first `tools/list` leaves out the write tools and the second includes them.
+
+### Writes and links locally
+
+The write tools change whatever `mise run dev` serves, so give them a scratch copy instead of `fixtures/webdav-root`:
+
+```bash
+d=$(mktemp -d) && cp -r fixtures/webdav-root/. "$d" && mise run dev -- "$d"
+```
+
+and send `X-CoF-Scopes: files:read files:write` to see and call them. Writes and uploads go through `staging/` under the state directory, which the local rclone reads at the same path, as in the pod.
+
+Links need a `LINK_KEY` of at least 32 characters in the server's environment (`LINK_KEY=$(openssl rand -hex 32) mise run dev -- "$d"`) and an address to put in front of their tokens: either run the auth front too (`mise run dev:auth`, with the same `LINK_KEY` in `auth/.dev.vars`) and fetch through `http://127.0.0.1:8788/dl/…`, or set `[links] public_url` in a config of your own. Calling `/dl` and `/ul` on the core directly works as well, with the internal token and an `X-CoF-Client-IP` header standing in for the Worker:
+
+```bash
+curl -s "${H[@]}" -H 'X-CoF-Scopes: files:read files:write' http://127.0.0.1:8080/mcp -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"create_download_link","arguments":{"paths":["/notes/todo.md"]}}}'; echo
+curl -s -H 'Authorization: Bearer dev-internal-token' -H 'X-CoF-Client-IP: 127.0.0.1' http://127.0.0.1:8080/dl/<token>/todo.md
+```
+
+`list_links` then shows the use; `job_status` the folder jobs; `state.db` sits in the state directory (`sqlite3 "$STATE_DIR/state.db" .tables`).
+
+### Against pCloud
+
+Tests and manual runs that touch a real pCloud use your own rclone remote (`mise run dev -- mypcloud:`) and keep every write inside one test folder: put everything else in `policy.protected` in the config you run with, or serve only that folder (`mise run dev -- mypcloud:test-folder`). `crates/rclone/tests/rcd.rs` has a read-only pCloud test that runs only when the remote it names exists on your machine (`CHANCE_OF_FILES_NO_PCLOUD=1` skips it). Deletes land in pCloud's trash, so check the web app's Trash after a test, and empty it there by hand if you want; nothing in this project can.
 
 ### MCP Inspector and Claude Code
 

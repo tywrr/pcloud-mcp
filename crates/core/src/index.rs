@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use crate::storage::HashKind;
+use crate::storage::{Entry, HashKind};
 
 /// Recursive totals of a folder: everything below it, at any depth.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -300,4 +300,25 @@ pub trait Index: Send + Sync {
     /// `path` when it is a folder below a root; with `confirm`, first applies a held removal.
     /// Returns what was done, for the model.
     fn refresh(&self, path: Option<&str>, confirm: bool) -> IndexResult<String>;
+
+    /// Records a file or folder our own write just made or changed (pCloud confirmed it), so
+    /// it shows at once and a walk that listed before the write doesn't undo it. Paths outside
+    /// every root are ignored.
+    fn record_write(&self, entry: &Entry) -> IndexResult<()> {
+        let _ = entry;
+        Ok(())
+    }
+
+    /// Records that our own delete or move took `path` (and everything under it) away.
+    fn record_delete(&self, path: &str) -> IndexResult<()> {
+        let _ = path;
+        Ok(())
+    }
+
+    /// Queues a walk of the folder at `path` (after a folder job, whose results only a listing
+    /// shows). Paths outside every root are ignored.
+    fn rewalk(&self, path: &str) -> IndexResult<()> {
+        let _ = path;
+        Ok(())
+    }
 }

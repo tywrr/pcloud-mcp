@@ -19,6 +19,8 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 
 [dev-dependencies]
+chance-of-files-core = { workspace = true, features = ["testing"] }
 base64.workspace = true
+bytes.workspace = true
 axum = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "process"] }

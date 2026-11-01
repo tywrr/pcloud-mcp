@@ -1,6 +1,6 @@
 # The core's config in the cluster, mounted at /etc/chance-of-files/config.toml. It follows
 # config.example.toml at the repo root (every option is documented there); keep the two in step.
-# Secrets never go here: INTERNAL_TOKEN and RC_PASS come from the Secret as env vars.
+# Secrets never go here: INTERNAL_TOKEN, RC_PASS and LINK_KEY come from the Secret as env vars.
 # An overlay replaces this whole file (configMapGenerator, behavior: replace).
 
 [server]
@@ -11,7 +11,7 @@ listen = "127.0.0.1:8080"
 deadline = "180s"
 # Browser origins allowed to send an Origin header; requests without one (the auth Worker) pass.
 allowed_origins = ["https://claude.ai", "https://claude.com"]
-# The chance-of-files-data volume: the index (and later links and jobs) live here.
+# The chance-of-files-data volume: index/index.db, state.db (jobs, links, audit) and staging/.
 state_dir = "/var/lib/chance-of-files"
 
 [rclone]
@@ -26,7 +26,8 @@ health_every = "5m"
 # Never listed, read or searched; errors say "not found". pCloud's client-side encrypted folder
 # is the obvious one. Paths are absolute and match the folder and everything under it.
 hidden = ["/Crypto Folder"]
-# Visible and readable, never written (enforced once write tools exist).
+# Visible and readable, never written: no write at, under or above them, and no move or copy into
+# or out of them. An overlay adds e.g. "/Backups/Immich".
 protected = []
 # Folders search_files leaves out, for huge trees such as a photo backup.
 search_skip = []
@@ -52,3 +53,22 @@ hash_min_size = 1048576
 [[index.roots]]
 path = "/"
 every = "30m"
+
+[writes]
+# The write tools offered to connections granted files:write ([] makes the server read-only).
+tools = ["create_folder", "move", "copy", "write_file", "delete"]
+max_inline_bytes = 5_000_000
+
+[links]
+# Needs LINK_KEY (Secret key link-key) and state_dir. The URL host comes from the auth Worker's
+# X-CoF-Public-Url header unless public_url is set here.
+default_ttl = "15m"
+max_ttl = "24h"
+bind = "net"                 # the first client's /24 (/64); a minor layer, Claude's egress is shared
+max_zip_bytes = "10GB"
+staging_max_bytes = "30GB"   # staging is <state_dir>/staging, which rclone sees read-only
+part_bytes = "90MiB"         # Cloudflare caps request bodies at 100 MB
+
+[disk]
+# Upload links are refused when they would leave less than this free on the data volume.
+reserve = "20GB"

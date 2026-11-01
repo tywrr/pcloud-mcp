@@ -6,21 +6,24 @@
 //!
 //! The config file comes from `--config`, else `CHANCE_OF_FILES_CONFIG`, else
 //! `/etc/chance-of-files/config.toml`. Secrets come from the environment: `INTERNAL_TOKEN`
-//! (what the auth Worker sends as a bearer token) and `RC_PASS` (rclone's rc password).
-//! Logs are JSON lines on stdout; `RUST_LOG` filters them (default `info`).
+//! (what the auth Worker sends as a bearer token), `RC_PASS` (rclone's rc password) and
+//! `LINK_KEY` (signs links; without it there are no links). Logs are JSON lines on stdout;
+//! `RUST_LOG` filters them (default `info`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use chance_of_files_core::{Health, McpServer};
+use chance_of_files_core::{Health, McpServer, StateStore};
 use chance_of_files_rclone::RcloneStorage;
 use chance_of_files_server::config::{self, DEFAULT_CONFIG_PATH};
+use chance_of_files_server::links::{LinkServer, housekeeping};
+use chance_of_files_server::state::State;
 use chance_of_files_server::{App, health_loop, router};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: chance-of-files [--config PATH]\n\nSee config.example.toml for the \
-                     file; INTERNAL_TOKEN and RC_PASS come from the environment.";
+                     file; INTERNAL_TOKEN, RC_PASS and LINK_KEY come from the environment.";
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -104,18 +107,49 @@ fn config_path(mut args: impl Iterator<Item = String>) -> Result<Option<PathBuf>
 }
 
 async fn serve(settings: config::Settings) -> Result<(), String> {
-    if let Some(dir) = &settings.state_dir {
-        // Phase 3 keeps state.db here; creating it now shows a volume problem at startup.
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!(dir = %dir.display(), error = %e, "can't create the state directory");
+    // Jobs, links and the audit log; without it the server is read-only, as v0.3 was.
+    let state = match &settings.state_dir {
+        Some(dir) => {
+            let staging = settings
+                .staging
+                .clone()
+                .unwrap_or_else(|| dir.join("staging"));
+            match State::open(dir, &staging) {
+                Ok(state) => Some(Arc::new(state)),
+                Err(e) => {
+                    tracing::error!(error = %e, "can't open state.db; writes and links are off");
+                    None
+                }
+            }
         }
-    }
+        None => {
+            tracing::warn!("no [server] state_dir: writes and links are off");
+            None
+        }
+    };
     let storage = Arc::new(RcloneStorage::new(settings.rclone)?);
     let fs = storage.fs().to_owned();
     let health = Arc::new(Health::new());
     let mut mcp = McpServer::new(storage.clone(), settings.core)
         .with_policy(settings.policy.clone())
         .with_health(health.clone());
+    if let Some(state) = &state {
+        mcp = mcp.with_state(state.clone() as Arc<dyn StateStore>);
+    }
+    let mut link_server = None;
+    match (&state, settings.links) {
+        (Some(state), Some(links)) => {
+            mcp = mcp.with_links(links.clone());
+            link_server = Some(LinkServer::new(state.clone(), links));
+        }
+        (_, _) => {
+            let why = settings
+                .links_off
+                .as_deref()
+                .unwrap_or("off: no state database");
+            tracing::warn!(reason = %why, "links are off");
+        }
+    }
 
     // Without a usable index the server still works, live, as v0.2 did.
     let mut indexer = None;
@@ -145,11 +179,11 @@ async fn serve(settings: config::Settings) -> Result<(), String> {
             }
         }
     }
-    let app = Arc::new(App::new(
-        mcp,
-        settings.internal_token,
-        settings.max_body_bytes,
-    ));
+    let mut app = App::new(mcp, settings.internal_token, settings.max_body_bytes);
+    if let Some(links) = link_server {
+        app = app.with_links(links);
+    }
+    let app = Arc::new(app);
 
     // rclone may start after us in the pod; capabilities are looked up until it answers, and
     // only then do health checks and walks start.
@@ -176,6 +210,8 @@ async fn serve(settings: config::Settings) -> Result<(), String> {
             probe.mcp.health().clone(),
             health_every,
         ));
+        tokio::spawn(jobs_loop(probe.clone()));
+        tokio::spawn(housekeeping(probe.clone()));
         if let Some(indexer) = indexer {
             indexer.run().await;
         }
@@ -195,6 +231,19 @@ async fn serve(settings: config::Settings) -> Result<(), String> {
         .map_err(|e| format!("server error: {e}"))?;
     tracing::info!("shut down");
     Ok(())
+}
+
+/// Follows async folder jobs to the end, so the index learns about them even if nobody asks
+/// job_status. Checking for running jobs is one query on state.db; rclone is asked only about
+/// jobs that run.
+async fn jobs_loop(app: Arc<App<Arc<RcloneStorage>>>) {
+    let Some(state) = app.mcp.state().cloned() else {
+        return;
+    };
+    loop {
+        chance_of_files_core::writes::poll_jobs(app.mcp.storage(), &state, app.mcp.index()).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 /// Resolves on SIGTERM (Kubernetes stopping the pod) or Ctrl-C.

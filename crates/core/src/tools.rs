@@ -1,11 +1,14 @@
-//! The read tools: definitions for `tools/list` and their implementations over a [`Storage`].
+//! The tools: definitions for `tools/list` and the read tools' implementations over a
+//! [`Storage`]; the write tools are in [`crate::writes`], the link tools in `linktools`, the
+//! index tools in `audit`.
 //!
 //! Problems the model can fix (a wrong path, a missing argument, a file that is too big) come
 //! back as tool results with `isError: true`, as MCP 2025-11-25 recommends, so the model sees
 //! the message and can retry. Only an unknown tool name is a protocol error.
 //!
-//! Every path from a client goes through [`Policy::check`] before any storage call, and every
-//! entry a backend returns goes through [`Policy::visible`] before it is shown.
+//! Every path from a client goes through [`Policy::check`] (writes: [`Policy::check_write`])
+//! before any storage call, and every entry a backend returns goes through
+//! [`Policy::visible`] before it is shown.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -20,11 +23,15 @@ use tokio::time::Instant;
 use crate::audit;
 use crate::health::Health;
 use crate::index::{Index, Sort};
+use crate::links::LinkSettings;
+use crate::linktools;
 use crate::matching::NameMatcher;
 use crate::policy::{CheckedPath, PathSet, Policy};
 use crate::scope::{Scope, Scopes};
 use crate::server::ServerConfig;
-use crate::storage::{ByteRange, Entry, Storage, StorageError, read_capped};
+use crate::state::StateStore;
+use crate::storage::{ByteRange, Entry, Storage, StorageError, StorageWrite, read_capped};
+use crate::writes;
 
 const LIST_FOLDER: &str = "list_folder";
 const GET_FILE_INFO: &str = "get_file_info";
@@ -38,23 +45,86 @@ pub(crate) const RECENT_CHANGES: &str = "recent_changes";
 pub(crate) const TYPE_BREAKDOWN: &str = "type_breakdown";
 pub(crate) const INDEX_STATUS: &str = "index_status";
 pub(crate) const REFRESH_INDEX: &str = "refresh_index";
+pub(crate) const JOB_STATUS: &str = "job_status";
+pub(crate) const CREATE_FOLDER: &str = "create_folder";
+pub(crate) const MOVE: &str = "move";
+pub(crate) const COPY: &str = "copy";
+pub(crate) const WRITE_FILE: &str = "write_file";
+pub(crate) const DELETE: &str = "delete";
+pub(crate) const CREATE_UPLOAD_LINK: &str = "create_upload_link";
+pub(crate) const CREATE_DOWNLOAD_LINK: &str = "create_download_link";
+pub(crate) const LIST_LINKS: &str = "list_links";
+pub(crate) const REVOKE_LINK: &str = "revoke_link";
 
-/// Every tool, the scope it needs and whether it needs the index, in `tools/list` order
-/// (2026-07-28 asks for a deterministic list so clients can cache it).
-const TOOLS: &[(&str, Scope, bool)] = &[
-    (LIST_FOLDER, Scope::Read, false),
-    (GET_FILE_INFO, Scope::Read, false),
-    (READ_TEXT_FILE, Scope::Read, false),
-    (READ_IMAGE, Scope::Read, false),
-    (SEARCH_FILES, Scope::Read, false),
-    (FOLDER_STATS, Scope::Read, true),
-    (QUERY_FILES, Scope::Read, true),
-    (FIND_DUPLICATES, Scope::Read, true),
-    (RECENT_CHANGES, Scope::Read, true),
-    (TYPE_BREAKDOWN, Scope::Read, true),
-    (INDEX_STATUS, Scope::Read, true),
-    (REFRESH_INDEX, Scope::Read, true),
+/// What a tool needs besides its scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Needs {
+    Nothing,
+    Index,
+    /// `state.db` (jobs).
+    State,
+    /// `state.db` and the server's `[writes] tools` naming it.
+    Write,
+    /// `state.db`, `LINK_KEY` and `[links]`.
+    Links,
+    /// Links, on a server that allows writes at all.
+    UploadLinks,
+}
+
+/// Every tool, the scope it needs and what else, in `tools/list` order (2026-07-28 asks for a
+/// deterministic list so clients can cache it).
+const TOOLS: &[(&str, Scope, Needs)] = &[
+    (LIST_FOLDER, Scope::Read, Needs::Nothing),
+    (GET_FILE_INFO, Scope::Read, Needs::Nothing),
+    (READ_TEXT_FILE, Scope::Read, Needs::Nothing),
+    (READ_IMAGE, Scope::Read, Needs::Nothing),
+    (SEARCH_FILES, Scope::Read, Needs::Nothing),
+    (FOLDER_STATS, Scope::Read, Needs::Index),
+    (QUERY_FILES, Scope::Read, Needs::Index),
+    (FIND_DUPLICATES, Scope::Read, Needs::Index),
+    (RECENT_CHANGES, Scope::Read, Needs::Index),
+    (TYPE_BREAKDOWN, Scope::Read, Needs::Index),
+    (INDEX_STATUS, Scope::Read, Needs::Index),
+    (REFRESH_INDEX, Scope::Read, Needs::Index),
+    (JOB_STATUS, Scope::Read, Needs::State),
+    (CREATE_FOLDER, Scope::Write, Needs::Write),
+    (MOVE, Scope::Write, Needs::Write),
+    (COPY, Scope::Write, Needs::Write),
+    (WRITE_FILE, Scope::Write, Needs::Write),
+    (DELETE, Scope::Write, Needs::Write),
+    (CREATE_UPLOAD_LINK, Scope::Write, Needs::UploadLinks),
+    (CREATE_DOWNLOAD_LINK, Scope::Read, Needs::Links),
+    (LIST_LINKS, Scope::Read, Needs::Links),
+    (REVOKE_LINK, Scope::Read, Needs::Links),
 ];
+
+/// Which optional parts the server has.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Parts {
+    pub(crate) index: bool,
+    pub(crate) state: bool,
+    pub(crate) links: bool,
+}
+
+/// Whether the server offers `name` at all (whatever the client's scopes).
+fn offered(config: &ServerConfig, parts: Parts, name: &str, needs: Needs) -> bool {
+    match needs {
+        Needs::Nothing => true,
+        Needs::Index => parts.index,
+        Needs::State => parts.state,
+        Needs::Write => parts.state && config.write_tools.iter().any(|t| t == name),
+        Needs::Links => parts.state && parts.links,
+        Needs::UploadLinks => parts.state && parts.links && !config.write_tools.is_empty(),
+    }
+}
+
+/// Write and link tools, whose calls go into the audit log.
+pub(crate) fn audited(name: &str) -> bool {
+    matches!(
+        TOOLS.iter().find(|(tool, _, _)| *tool == name),
+        Some((_, _, Needs::Write | Needs::UploadLinks))
+    ) || matches!(name, CREATE_DOWNLOAD_LINK | REVOKE_LINK)
+}
 
 /// Most entries one `list_folder` page shows.
 const MAX_LIST_ENTRIES: usize = 1000;
@@ -87,6 +157,10 @@ pub(crate) struct Ctx<'a, S> {
     pub(crate) policy: &'a Policy,
     pub(crate) index: Option<&'a Arc<dyn Index>>,
     pub(crate) health: &'a Health,
+    pub(crate) state: Option<&'a Arc<dyn StateStore>>,
+    pub(crate) links: Option<&'a LinkSettings>,
+    /// Where the auth Worker is reached, from its trusted `X-CoF-Public-Url` header.
+    pub(crate) public_url: Option<&'a str>,
     pub(crate) deadline: Instant,
 }
 
@@ -110,6 +184,9 @@ impl<'a, S: Storage> Ctx<'a, S> {
             policy,
             index,
             health,
+            state: None,
+            links: None,
+            public_url: None,
             deadline: Instant::now() + config.deadline,
         }
     }
@@ -182,22 +259,73 @@ impl<'a, S: Storage> Ctx<'a, S> {
     pub(crate) fn check(&self, path: &str) -> Result<CheckedPath, String> {
         self.policy.check(path).map_err(storage_error)
     }
+
+    /// A state database call on the blocking pool.
+    pub(crate) async fn st<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&dyn StateStore) -> crate::state::StateResult<T> + Send + 'static,
+    ) -> Result<T, String> {
+        let state = self
+            .state
+            .ok_or(
+                "This server keeps no state (no [server] state_dir), so it has no jobs or links.",
+            )?
+            .clone();
+        tokio::task::spawn_blocking(move || work(&*state))
+            .await
+            .map_err(|e| format!("state database task failed: {e}"))?
+            .map_err(|e| e.to_string())
+    }
+
+    /// An index call on the blocking pool; failures are logged by the caller's result only.
+    pub(crate) async fn ix_quiet(
+        &self,
+        work: impl FnOnce(&dyn Index) -> crate::index::IndexResult<()> + Send + 'static,
+    ) -> Option<String> {
+        let index = self.index?.clone();
+        match tokio::task::spawn_blocking(move || work(&*index)).await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        }
+    }
 }
 
 /// Tool definitions the client's scopes allow, in a fixed order. Limits in the descriptions
 /// and schemas come from `config`.
-pub(crate) fn definitions(config: &ServerConfig, scopes: Scopes, indexed: bool) -> Vec<Tool> {
+pub(crate) fn definitions(
+    config: &ServerConfig,
+    scopes: Scopes,
+    parts: Parts,
+    links: Option<&LinkSettings>,
+) -> Vec<Tool> {
     TOOLS
         .iter()
-        .filter(|(_, scope, needs_index)| scopes.contains(*scope) && (indexed || !needs_index))
+        .filter(|(name, scope, needs)| {
+            scopes.contains(*scope) && offered(config, parts, name, *needs)
+        })
         .map(|(name, _, _)| {
-            if indexed {
+            if let Some(tool) = writes::definition(config, name) {
+                return tool;
+            }
+            if let Some(tool) = links.and_then(|l| linktools::definition(l, name)) {
+                return tool;
+            }
+            if parts.index {
                 audit::definition(config, name).unwrap_or_else(|| definition(config, name))
             } else {
                 definition(config, name)
             }
         })
         .collect()
+}
+
+/// Whether any write tool is offered to a client with `scopes`.
+pub(crate) fn can_write(config: &ServerConfig, scopes: Scopes, parts: Parts) -> bool {
+    scopes.contains(Scope::Write)
+        && TOOLS
+            .iter()
+            .any(|(name, _, needs)| *needs == Needs::Write && offered(config, parts, name, *needs))
 }
 
 fn definition(config: &ServerConfig, name: &str) -> Tool {
@@ -352,30 +480,63 @@ fn definition(config: &ServerConfig, name: &str) -> Tool {
 }
 
 pub(crate) fn tool(name: &'static str, title: &str, description: &str, schema: Value) -> Tool {
-    let schema: Arc<JsonObject> = Arc::new(object(schema));
-    // Every tool so far only reads. The title is repeated in the annotations for 2025-03-26
-    // clients, which predate Tool.title.
+    // The title is repeated in the annotations for 2025-03-26 clients, which predate
+    // Tool.title.
     let annotations = ToolAnnotations::with_title(title)
         .read_only(true)
         .destructive(false)
         .idempotent(true)
         .open_world(false);
+    annotated(name, title, description, schema, annotations)
+}
+
+/// A tool that changes something or lets data leave: `destructiveHint` makes Claude ask the
+/// owner before every call.
+pub(crate) fn destructive_tool(
+    name: &'static str,
+    title: &str,
+    description: &str,
+    schema: Value,
+    idempotent: bool,
+    open_world: bool,
+) -> Tool {
+    let annotations = ToolAnnotations::with_title(title)
+        .read_only(false)
+        .destructive(true)
+        .idempotent(idempotent)
+        .open_world(open_world);
+    annotated(name, title, description, schema, annotations)
+}
+
+fn annotated(
+    name: &'static str,
+    title: &str,
+    description: &str,
+    schema: Value,
+    annotations: ToolAnnotations,
+) -> Tool {
+    let schema: Arc<JsonObject> = Arc::new(object(schema));
     Tool::new(name, description.to_owned(), schema)
         .with_title(title)
         .with_annotations(annotations)
 }
 
-/// Runs a tool, if the client's scopes allow it.
-pub(crate) async fn call<S: Storage>(
+/// Runs a tool, if the server offers it and the client's scopes allow it.
+pub(crate) async fn call<S: StorageWrite>(
     ctx: &Ctx<'_, S>,
     name: &str,
     args: &Map<String, Value>,
     scopes: Scopes,
 ) -> Called {
-    let Some(&(_, scope, needs_index)) = TOOLS.iter().find(|(tool, _, _)| *tool == name) else {
+    let Some(&(_, scope, needs)) = TOOLS.iter().find(|(tool, _, _)| *tool == name) else {
         return Called::Unknown;
     };
-    if needs_index && ctx.index.is_none() {
+    let parts = Parts {
+        index: ctx.index.is_some(),
+        state: ctx.state.is_some(),
+        links: ctx.links.is_some(),
+    };
+    if !offered(ctx.config, parts, name, needs) {
         return Called::Unknown;
     }
     if !scopes.contains(scope) {
@@ -392,11 +553,28 @@ pub(crate) async fn call<S: Storage>(
         READ_TEXT_FILE => plain(read_text_file(ctx, &args).await),
         READ_IMAGE => plain(read_image(ctx, &args).await),
         SEARCH_FILES => search_files(ctx, &args).await,
-        name => match audit::call(ctx, name, &args).await {
+        name => match writes::call(ctx, name, &args).await {
             Some(output) => output,
-            None => return Called::Unknown,
+            None => match linktools::call(ctx, name, &args).await {
+                Some(output) => output,
+                None => match audit::call(ctx, name, &args).await {
+                    Some(output) => output,
+                    None => return Called::Unknown,
+                },
+            },
         },
     };
+    if audited(name) && ctx.state.is_some() {
+        let result = match &output {
+            Ok((content, _)) => format!("ok: {}", first_line(content)),
+            Err(message) => format!("error: {message}"),
+        };
+        let shown = writes::audit_args(args.0);
+        let (tool, at) = (name.to_owned(), crate::time::now());
+        let _ = ctx
+            .st(move |state| state.audit(at, &tool, &shown, &result))
+            .await;
+    }
     Called::Done(match output {
         Ok((content, structured)) => {
             let mut result = CallToolResult::success(content);
@@ -405,6 +583,20 @@ pub(crate) async fn call<S: Storage>(
         }
         Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
     })
+}
+
+/// The first line of a result's text, for the audit log.
+fn first_line(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(300)
+        .collect()
 }
 
 /// Folders first, then files, each by name ignoring case.
@@ -1104,10 +1296,13 @@ pub(crate) fn storage_error(err: StorageError) -> String {
         StorageError::Backend(_) | StorageError::Unhealthy(_) => {
             " The file server may be offline; try again later."
         }
-        StorageError::PermissionDenied(_)
-        | StorageError::AlreadyExists(_)
-        | StorageError::Protected(_)
-        | StorageError::Unsupported(_) => "",
+        StorageError::AlreadyExists(_) => {
+            " Pass overwrite=true to replace a file, or choose another name."
+        }
+        StorageError::Protected(_) => {
+            " The owner made it read-only; nothing at, under or around it can be changed here."
+        }
+        StorageError::PermissionDenied(_) | StorageError::Unsupported(_) => "",
     };
     let message = redact_urls(&err.to_string());
     let stop = if message.ends_with('.') { "" } else { "." };

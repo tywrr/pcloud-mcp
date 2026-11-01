@@ -6,6 +6,7 @@ import { defineConfig } from "vitest/config";
 const TEST_SECRETS = {
 	INTERNAL_TOKEN: "test-internal-token",
 	OWNER_PASSPHRASE: "test-owner-passphrase",
+	LINK_KEY: "test-link-key-0123456789abcdef0123456789",
 };
 Object.assign(process.env, TEST_SECRETS);
 

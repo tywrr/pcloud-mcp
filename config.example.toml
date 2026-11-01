@@ -1,12 +1,14 @@
-# chance-of-files configuration (v0.3: read-only tools and the metadata index).
+# chance-of-files configuration (v0.4: the metadata index, write tools, jobs and links).
 #
 # The server reads this file from --config, else $CHANCE_OF_FILES_CONFIG, else
 # /etc/chance-of-files/config.toml. Every key is optional; the values below are the defaults.
 # Unknown keys are logged and ignored.
 #
 # Secrets never go in this file. They come from the environment:
-#   INTERNAL_TOKEN  the bearer token the auth Worker sends on every /mcp request
+#   INTERNAL_TOKEN  the bearer token the auth Worker sends on every request
 #   RC_PASS         the password of rclone's remote-control API (user [rclone].user)
+#   LINK_KEY        signs download and upload links (the auth Worker has the same value);
+#                   without it there are no links
 #
 # Paths are absolute paths on the drive ("/" is its root). Rules match ignoring case and
 # accents, so "/crypto folder" also covers "/Crypto Folder".
@@ -21,9 +23,10 @@ deadline = "180s"
 # Browser origins allowed in an Origin header, on top of https://claude.ai and
 # https://claude.com, which are always allowed. Requests without an Origin are always allowed.
 allowed_origins = []
-# A writable directory for state kept across restarts, created at startup if set. The index
-# lives in its "index" subdirectory unless [index].dir says otherwise; later versions keep links
-# and jobs here too. In the pod: the chance-of-files-data volume.
+# A writable directory for state kept across restarts, created at startup if set: the index
+# (its "index" subdirectory unless [index].dir says otherwise), state.db (async jobs, links and
+# their use, the audit log of writes) and "staging" (upload parts). Without it the server is
+# read-only: no write tools, jobs or links. In the pod: the chance-of-files-data volume.
 # state_dir = "/var/lib/chance-of-files"
 
 [rclone]
@@ -44,8 +47,9 @@ health_every = "5m"
 # read or written, and any path under them answers "not found".
 # hidden = ["/Crypto Folder"]
 hidden = []
-# Folders that stay visible and readable but are never changed (enforced by the write tools of
-# a later version; listed now so the rule is in place before writes exist).
+# Folders that stay visible and readable (and linkable) but are never changed: every write at or
+# under them is refused, and so is any move or copy into or out of them, and any move, copy or
+# delete of a folder above them.
 # protected = ["/Backups/Immich"]
 protected = []
 # Folders search_files leaves out of its results (and doesn't fetch, without an index);
@@ -70,7 +74,8 @@ max_listing_bytes = 64000000
 # Most results one search_files call returns; with the index, a cursor fetches more.
 search_limit = 50
 # Largest /mcp request body accepted.
-max_body_bytes = 1048576
+# Must hold a write_file of writes.max_inline_bytes as base64 (a third more, plus JSON).
+max_body_bytes = 8388608
 
 [index]
 # A SQLite index of every visible file and folder, kept current by walks, so list_folder,
@@ -100,3 +105,40 @@ every = "30m"
 # [[index.roots]]
 # path = "/Backups/Immich"
 # every = "6h"
+
+[writes]
+# The write tools offered to connections whose grant has files:write (the owner ticks it on the
+# consent page). Each one is marked destructive, so Claude asks before every call. Deletes go to
+# pCloud's trash; on a backend without a trash, delete is refused. [] makes the server read-only.
+tools = ["create_folder", "move", "copy", "write_file", "delete"]
+# Largest file write_file takes inline (text or base64); bigger ones need an upload link.
+max_inline_bytes = 5_000_000
+
+[links]
+# Expiring HTTPS links for transfers too big for a tool result: create_download_link (one file
+# with Range, or a streamed zip) and create_upload_link (a file in parts). They need LINK_KEY and
+# [server].state_dir; enabled = false turns them off.
+enabled = true
+# Where links are reached. Empty: the auth Worker says, in an X-CoF-Public-Url header on each
+# request it forwards. Set it to an https:// URL to override.
+public_url = ""
+# How long a link works when the model doesn't say, and at most. Units: s, m, h, d.
+default_ttl = "15m"
+max_ttl = "24h"
+# The first client to use a link binds it: "net" (its /24, or /64 for IPv6), "ip" (exactly) or
+# "none". Claude's traffic leaves from a shared range, so this keeps out the open internet only;
+# expiry, the byte allowance (3x the size), asking first and revoke_link do the real work.
+bind = "net"
+# Largest streamed zip (the files inside it). Above this, use one resumable link per file.
+max_zip_bytes = "10GB"
+# Where upload parts are kept until the file is complete; default "<server.state_dir>/staging".
+# rclone must be able to read it at the same path (the file goes to pCloud with copyfile).
+# staging = "/var/lib/chance-of-files/staging"
+# Largest upload, and the most staging space all unfinished uploads may hold together.
+staging_max_bytes = "30GB"
+# Largest upload part. Cloudflare refuses request bodies over 100 MB.
+part_bytes = "90MiB"
+
+[disk]
+# Upload links are refused when they would leave less than this free where they are staged.
+reserve = "20GB"

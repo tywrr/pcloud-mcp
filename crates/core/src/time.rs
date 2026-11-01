@@ -135,6 +135,13 @@ pub fn parse_age(text: &str) -> Option<i64> {
     number.checked_mul(scale)
 }
 
+/// Year, month, day, hour, minute, second (UTC) of a Unix time.
+pub fn civil(ts: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let (y, mo, d) = civil_from_days(ts.div_euclid(86_400));
+    let s = ts.rem_euclid(86_400) as u32;
+    (y, mo, d, s / 3600, s / 60 % 60, s % 60)
+}
+
 /// `2026-10-29T12:00:00Z`.
 pub fn rfc3339(ts: i64) -> String {
     let (y, mo, d) = civil_from_days(ts.div_euclid(86_400));

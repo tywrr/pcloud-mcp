@@ -196,6 +196,9 @@ fn under(path: &str, folder: &str) -> bool {
     folder == "/" && path != "/" || path.starts_with(&format!("{folder}/"))
 }
 
+/// Read-only.
+impl chance_of_files_core::StorageWrite for Tree {}
+
 impl Storage for Tree {
     fn capabilities(&self) -> Capabilities {
         Capabilities {

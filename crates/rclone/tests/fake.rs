@@ -140,7 +140,30 @@ async fn rc(State(fake): State<Shared>, request: Request) -> Response {
             None => json!({"item": null}),
         },
         "operations/about" => json!({"total": 100, "used": 10, "free": 90}),
-        "operations/fsinfo" => json!({"Hashes": ["md5", "sha1"], "Features": {"DirMove": true}}),
+        "operations/fsinfo" => {
+            json!({"String": "pcloud root ''", "Hashes": ["md5", "sha1"], "Features": {"DirMove": true}})
+        }
+        "operations/mkdir" => {
+            fake.tree.insert(remote, None);
+            json!({})
+        }
+        "operations/movefile" | "operations/copyfile" => {
+            let src = input["srcRemote"].as_str().unwrap().to_owned();
+            let dst = input["dstRemote"].as_str().unwrap().to_owned();
+            let data = fake.tree.get(&src).cloned().flatten();
+            if method == "operations/movefile" {
+                fake.tree.remove(&src);
+            }
+            fake.tree.insert(dst, data);
+            json!({})
+        }
+        "operations/deletefile" => {
+            fake.tree.remove(&remote);
+            json!({})
+        }
+        "operations/purge" | "sync/move" | "sync/copy" => json!({"jobid": 7}),
+        "job/status" => json!({"finished": true, "success": true, "error": "",
+                               "startTime": chance_of_files_core::time::rfc3339(chance_of_files_core::time::now())}),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     axum::Json(answer).into_response()
@@ -232,6 +255,9 @@ impl Harness {
         let fake = Arc::new(Mutex::new(fake));
         let app = Router::new()
             .route("/operations/{*op}", axum::routing::post(rc))
+            .route("/sync/{*op}", axum::routing::post(rc))
+            .route("/job/{*op}", axum::routing::post(rc))
+            .route("/core/{*op}", axum::routing::post(rc))
             .fallback(axum::routing::get(serve))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -243,6 +269,7 @@ impl Harness {
             password: password.into(),
             remote: "pcloud".into(),
             max_listing_bytes,
+            staging: None,
         })
         .unwrap();
         let policy =
@@ -516,6 +543,7 @@ async fn an_unreachable_rclone_is_a_backend_error_without_the_url() {
         password: PASSWORD.into(),
         remote: "pcloud".into(),
         max_listing_bytes: 1000,
+        staging: None,
     })
     .unwrap();
     let err = storage.health().await.unwrap_err();
@@ -525,4 +553,105 @@ async fn an_unreachable_rclone_is_a_backend_error_without_the_url() {
         !text.contains("127.0.0.1") && !text.contains(PASSWORD),
         "{text}"
     );
+}
+
+/// The write tools through a real RcloneStorage: what reaches rclone for allowed writes, and
+/// that nothing does for hidden or protected paths (rclone's filters wouldn't stop single-object
+/// calls; phase 0).
+#[tokio::test]
+async fn writes_send_only_policy_checked_calls() {
+    use chance_of_files_core::memory::MemoryState;
+    use chance_of_files_core::{Caller, McpServer, Scopes, ServerConfig};
+
+    let h = Harness::new(tree(), 1_000_000).await;
+    h.storage.load_capabilities().await.unwrap();
+    h.fake.lock().unwrap().log.clear();
+    let policy = Policy::new(&["/Crypto Folder"], &["/Backups/Immich"], &[] as &[&str]).unwrap();
+    let server = McpServer::new(h.storage, ServerConfig::default())
+        .with_policy(policy)
+        .with_state(Arc::new(MemoryState::default()));
+    let caller = Caller {
+        scopes: Scopes::all(),
+        public_url: None,
+    };
+    let call = |name: &str, args: Value| {
+        let msg = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": args}});
+        let server = &server;
+        let caller = &caller;
+        async move {
+            let r = server.handle_jsonrpc_as(msg, caller).await.unwrap();
+            (
+                r["result"]["isError"] != json!(true),
+                r["result"]["content"][0]["text"].clone(),
+            )
+        }
+    };
+    let writes = |log: &[String]| -> Vec<String> {
+        log.iter()
+            .filter(|l| !l.contains("operations/stat") && !l.contains("operations/list"))
+            .cloned()
+            .collect()
+    };
+
+    for (name, args) in [
+        ("delete", json!({"path": "/Crypto Folder/keys.txt"})),
+        (
+            "copy",
+            json!({"from": "/Crypto Folder/keys.txt", "to": "/Notes/k.txt"}),
+        ),
+        ("move", json!({"from": "/Crypto Folder", "to": "/Notes/c"})),
+        ("delete", json!({"path": "/Backups/Immich/2026/IMG_1.jpg"})),
+        ("delete", json!({"path": "/Backups"})),
+        (
+            "move",
+            json!({"from": "/Notes/todo.md", "to": "/Backups/Immich/todo.md"}),
+        ),
+        (
+            "copy",
+            json!({"from": "/Backups/Immich/2026", "to": "/Notes/2026"}),
+        ),
+        ("create_folder", json!({"path": "/Backups/Immich/x"})),
+    ] {
+        let (ok, text) = call(name, args.clone()).await;
+        assert!(!ok, "{name} {args}: {text}");
+    }
+    let log = h.fake.lock().unwrap().log.clone();
+    assert!(writes(&log).is_empty(), "{log:#?}");
+    assert!(!log.iter().any(|l| l.contains("Crypto Folder")), "{log:#?}");
+    h.fake.lock().unwrap().log.clear();
+
+    // Allowed writes: one rc call each; folders with _async and never a _filter.
+    assert!(
+        call(
+            "move",
+            json!({"from": "/Notes/todo.md", "to": "/Notes/deep/todo.md"})
+        )
+        .await
+        .0
+    );
+    assert!(
+        call(
+            "move",
+            json!({"from": "/Notes/deep", "to": "/Backups/phone/deep"})
+        )
+        .await
+        .0
+    );
+    assert!(call("delete", json!({"path": "/readme.txt"})).await.0);
+    let log = h.fake.lock().unwrap().log.clone();
+    let sent = writes(&log);
+    assert_eq!(sent.len(), 3, "{sent:#?}");
+    assert!(sent[0].starts_with("POST operations/movefile"), "{sent:#?}");
+    assert!(sent[1].starts_with("POST sync/move"), "{sent:#?}");
+    assert!(
+        sent[1].contains("\"_async\":true")
+            && sent[1].contains("\"dstFs\":\"pcloud:Backups/phone/deep\""),
+        "{sent:#?}"
+    );
+    assert!(
+        sent[2].starts_with("POST operations/deletefile"),
+        "{sent:#?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("_filter")), "{log:#?}");
 }

@@ -154,6 +154,70 @@ Links, jobs and the audit log of own writes go into a separate `state.db` in 0.4
 
 Every index tool returns a header line, for example `[rows 1-500 of 13,204 · / as of 14:05Z, /Backups/Immich as of 09:00Z · next cursor=…]`, keeps its result under 120,000 characters, and pages with an opaque cursor that encodes the last row's sort key and the index generation. Audit tools also return `structuredContent`. Hidden paths are never in the index, so they can't appear in a result; `policy.protected` only matters for writes.
 
+## Links
+
+From 0.4, `create_download_link` and `create_upload_link` hand out expiring HTTPS links for transfers too big for a tool result, such as fetching a folder onto Duet's computer or sending a dataset back. Links go through the auth Worker on workers.dev; there is no public tunnel hostname. The Worker checks a link before forwarding it, and the core checks everything again and decides. This section is the contract between the two.
+
+**URLs.** `https://<worker>/dl/<token>/<name>` (download; `<name>` is only for `curl -O` and is ignored) and `https://<worker>/ul/<token>` (upload). The core builds them from the Worker's origin, which the Worker sends as `X-CoF-Public-Url` on every `/mcp` request (`[links] public_url` overrides it).
+
+**Tokens.** `<id>.<exp>.<mac>`:
+
+| Part | What |
+|---|---|
+| `id` | 16 random bytes, unpadded base64url (22 characters); the `links` row in `state.db` |
+| `exp` | Expiry, Unix seconds, decimal ASCII digits |
+| `mac` | The first 16 bytes of HMAC-SHA256(key, `"<kind>.<id>.<exp>"`), unpadded base64url (22 characters). `kind` is `dl` or `ul`, taken from the route, so a token works on one route only |
+| key | The UTF-8 bytes of `LINK_KEY` as stored (at least 32 characters, no trailing newline). The core gets it from the Secret key `link-key`, the Worker from its secret `LINK_KEY`; rotating it kills every link |
+
+Test vectors (in `crates/core/src/links.rs`), key `test-link-key-0123456789abcdef0123456789`, id `AAAAAAAAAAAAAAAAAAAAAA`, exp `1900000000`:
+
+- `dl`: `AAAAAAAAAAAAAAAAAAAAAA.1900000000.-m9jVnui9Q5UG9NP0NRQyQ`
+- `ul`: `AAAAAAAAAAAAAAAAAAAAAA.1900000000.OrCNstMVWn-HHbWyszsjSw`
+
+**What the Worker does** on `/dl/*` and `/ul/*`:
+
+1. Rate limit: 60 requests a minute per client IP, `429` past that.
+2. Pre-check the token: shape, MAC (constant time), `exp` in the future. A bad token gets `404` and never reaches the cluster; an expired one `410`.
+3. Strip every client header named `X-CoF-*` and `Authorization`.
+4. Forward to `CORE` with the same method, path, query and body (streamed, not buffered), plus:
+
+| Header | Value |
+|---|---|
+| `Authorization` | `Bearer <INTERNAL_TOKEN>` |
+| `X-CoF-Client-IP` | `CF-Connecting-IP` |
+| passed through | `Range`, `Content-Range`, `Content-Length`, `Content-Type` |
+
+5. Return the core's status, headers and body untouched (streamed), so the Worker's CPU stays far under the free plan's 10 ms.
+
+On `/mcp` the Worker also adds `X-CoF-Public-Url: <its origin>` (e.g. `https://chance-of-files.example.workers.dev`). The core trusts `X-CoF-Client-IP` and `X-CoF-Public-Url` only on requests carrying the internal token, like `X-CoF-Scopes`.
+
+**What the core checks**, in order, on every link request: the internal token (`401`); `X-CoF-Client-IP` present (`400`); the token's MAC for this route (`404`) and expiry (`410`); a `links` row with that id, kind and expiry (`404`); the row's state (revoked or expired: `410`); the binding (`403`); the byte allowance (`410`). Every request that names a real link is logged in `link_log` (time, client IP, range or part, bytes, status), and `list_links` shows it.
+
+| Rule | |
+|---|---|
+| Expiry | 15 minutes by default, 24 hours at most (`[links] default_ttl`, `max_ttl`) |
+| Binding | The first client's /24 (IPv4) or /64 (IPv6) binds the link; requests from elsewhere get `403`. Claude's and Duet's traffic leaves from Anthropic's shared 160.79.104.0/21, so this keeps out the open internet only, not other Claude users ([phase 0](design/phase0-network.md)). The real protections are the unguessable URL, the short expiry, the byte allowance, Claude asking before every link (`destructiveHint`), and `list_links` / `revoke_link` |
+| Allowance | 3× the payload (at least 1 MiB) in all, retries and resumes included; then `410` |
+| Scope | A download link serves exactly the paths it was made for, never a hidden one; the policy is applied again at each request. An upload link has one destination, refused at creation and again at completion if it is protected |
+
+**Downloads.** `GET` and `HEAD /dl/<token>/<name>`.
+
+- A file: `200`, or `206` for a single `Range` (`bytes=a-b`, `a-`, `-n`) with `Content-Range`, `Accept-Ranges: bytes`, `Content-Length` and `Last-Modified`, so `curl -C -` resumes. The core checks the range against a fresh size and answers an unsatisfiable or multi-part range with `416` and `Content-Range: bytes */<size>` itself (rclone's `--rc-serve` answers past the end with an empty `206`).
+- A zip: `200`, `Accept-Ranges: none`, and an exact `Content-Length` computed before streaming (STORE, ZIP64 where needed, CRC-32 in data descriptors). The folder is walked again at each request, without hidden paths. A file that changes size mid-stream breaks the transfer. Not resumable: fetch again within the allowance. Over `[links] max_zip_bytes` (10 GB) the tool offers one link per file instead.
+- Every answer: `Content-Type: application/octet-stream`, `Content-Disposition: attachment` (with an RFC 5987 `filename*`), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Content-Security-Policy: sandbox`, `Referrer-Policy: no-referrer`; the links share an origin with the OAuth pages.
+
+**Uploads.** `/ul/<token>`, for one file of the size given at creation, in parts of at most `[links] part_bytes` (90 MiB: Cloudflare caps request bodies at 100 MB).
+
+| Request | Answer |
+|---|---|
+| `PUT ?part=K`, body = part K | Part K covers bytes `K × part_bytes` up to the next part or the end, so `split -b 90M` output maps straight onto it. `200` with the state as JSON; `409` with `Upload-Offset` if it isn't the next part; a part already received is skipped (`200`, `"skipped": true`), so rerunning a loop resumes; `400` for a body of the wrong length (nothing of it is kept) |
+| `PUT` with `Content-Range: bytes a-b/total` | The same, by offset |
+| `HEAD` | `Upload-Offset` (bytes committed) and `Upload-Length` |
+| `GET` | `{"id", "state", "path", "size", "committed", "expires", "note"}`; `state` is `active`, `finishing`, `done`, `failed`, `revoked` or `expired` |
+| `POST ?finish` (or `PUT ?finish`) | Retries a completion that failed |
+
+The part that completes the file gets `202` and `"state": "finishing"`: the core then sends the staged file to pCloud (`operations/copyfile` from `staging/`, which rclone reads at the same path; pCloud has no streaming upload), checks size and SHA-1 against what arrived, records it in the index, deletes the staging file and sets `done` (or `failed` with the reason in `note`). Clients poll `GET` for that. Staging survives a pod restart, `HEAD` gives the offset to resume from, and an interrupted completion restarts by itself. Creating the link reserves its size against `[links] staging_max_bytes` and the free space above `[disk] reserve`; staging of revoked and expired uploads is deleted within a minute.
+
 ## Configuration
 
 One TOML file, from `--config`, else `CHANCE_OF_FILES_CONFIG`, else `/etc/chance-of-files/config.toml`. Secrets come only from the environment: `INTERNAL_TOKEN` and `RC_PASS`. Every option is documented in [`config.example.toml`](../config.example.toml); the cluster's copy is [`deploy/k8s/base/config.toml`](../deploy/k8s/base/config.toml).

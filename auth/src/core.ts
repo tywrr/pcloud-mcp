@@ -1,7 +1,6 @@
-// Forwarding authorized /mcp requests to the core in the owner's cluster, over the Workers VPC
-// service bound as CORE (→ tunnel chance-of-files → cloudflared → 127.0.0.1:8080 in the pod).
-
-import { FILE_SCOPES } from "./config";
+// Forwarding authorized /mcp requests and signed /dl and /ul link requests to the core in the
+// owner's cluster, over the Workers VPC service bound as CORE (→ tunnel chance-of-files →
+// cloudflared → 127.0.0.1:8080 in the pod).
 
 /**
  * The VPC service decides where requests go; the URL supplies only the path and the Host header.
@@ -36,12 +35,17 @@ function isLoopbackHost(hostname: string): boolean {
 }
 
 /**
- * Sends the request on unchanged except for credentials and private headers: Claude's access token
- * is replaced by the internal token the core checks, cookies and any client-sent X-CoF-* header
- * are dropped, and X-CoF-Scopes carries the token's file scopes. The core's response, including a
- * streamed body, comes back as is.
+ * Sends the request on unchanged except for credentials and private headers: the caller's
+ * Authorization is replaced by the internal token the core checks, cookies and any client-sent
+ * X-CoF-* header are dropped, and `privateHeaders` (X-CoF-Scopes and X-CoF-Public-Url for /mcp,
+ * X-CoF-Client-IP for links) are set. Bodies stream both ways: the request body is passed on as
+ * the client's stream, and the core's response comes back as is.
  */
-export async function forwardToCore(request: Request, env: Env, scopes: readonly string[]): Promise<Response> {
+export async function forwardToCore(
+	request: Request,
+	env: Env,
+	privateHeaders: Record<string, string>,
+): Promise<Response> {
 	// `echo token | wrangler secret put` stores a trailing newline, which fetch rejects in a header.
 	const token = env.INTERNAL_TOKEN?.replace(/[\r\n]+$/, "");
 	if (!token) {
@@ -55,7 +59,10 @@ export async function forwardToCore(request: Request, env: Env, scopes: readonly
 	const privateNames = [...headers.keys()].filter((name) => name.toLowerCase().startsWith(PRIVATE_HEADER_PREFIX));
 	for (const name of privateNames) headers.delete(name);
 	headers.set("Authorization", `Bearer ${token}`);
-	headers.set("X-CoF-Scopes", scopes.filter((scope) => FILE_SCOPES.includes(scope)).join(" "));
+	for (const [name, value] of Object.entries(privateHeaders)) {
+		if (!name.toLowerCase().startsWith(PRIVATE_HEADER_PREFIX)) throw new Error(`${name} is not a private header`);
+		headers.set(name, value);
+	}
 	headers.delete("Cookie");
 
 	const incoming = new URL(request.url);

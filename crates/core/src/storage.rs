@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -230,6 +231,137 @@ impl<T: Storage> Storage for Arc<T> {
 
     async fn health(&self) -> Result<(), StorageError> {
         (**self).health().await
+    }
+}
+
+/// A backend's id for a long-running operation (rclone: the rc job id).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JobId(pub String);
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What a write did: finished, or started a job to follow with [`StorageWrite::job`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Done {
+    Now(Entry),
+    Job(JobId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    Done,
+    Failed(String),
+    /// The backend doesn't know the job (it restarted, or forgot it).
+    Lost,
+}
+
+/// A job as the backend reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobInfo {
+    pub state: JobState,
+    /// When the backend started it (Unix seconds), to tell a reused id from ours.
+    pub started: Option<i64>,
+    /// Progress for people, e.g. "1.2 GiB of 4.0 GiB, 31 of 120 files".
+    pub progress: Option<String>,
+}
+
+/// Changes to a file tree. Every method has a default that refuses, so a read-only backend
+/// implements this with an empty `impl`.
+///
+/// Folder operations may run long and return [`Done::Job`]; files finish at once. Paths are
+/// [`CheckedPath`]s: the caller has already applied [`crate::Policy::check_write`].
+#[trait_variant::make(Send)]
+pub trait StorageWrite: Storage {
+    /// Creates a folder and any missing parents; an existing folder is fine.
+    fn mkdir<'a>(
+        &'a self,
+        path: &'a CheckedPath,
+    ) -> impl Future<Output = Result<Entry, StorageError>> {
+        let _ = path;
+        async { Err(read_only()) }
+    }
+    /// Moves or renames `from` to the full path `to`, which must not exist.
+    fn rename<'a>(
+        &'a self,
+        from: &'a CheckedPath,
+        to: &'a CheckedPath,
+    ) -> impl Future<Output = Result<Done, StorageError>> {
+        let _ = (from, to);
+        async { Err(read_only()) }
+    }
+    /// Copies `from` to the full path `to` (server-side where the backend can).
+    fn copy<'a>(
+        &'a self,
+        from: &'a CheckedPath,
+        to: &'a CheckedPath,
+    ) -> impl Future<Output = Result<Done, StorageError>> {
+        let _ = (from, to);
+        async { Err(read_only()) }
+    }
+    /// Moves a file or folder to the backend's trash. Refused unless
+    /// [`Capabilities::trash_on_delete`]: nothing here deletes for good.
+    fn trash<'a>(
+        &'a self,
+        path: &'a CheckedPath,
+    ) -> impl Future<Output = Result<Done, StorageError>> {
+        let _ = path;
+        async { Err(read_only()) }
+    }
+    /// Writes a small file whole, replacing any file at `to`.
+    fn put_bytes<'a>(
+        &'a self,
+        data: Bytes,
+        to: &'a CheckedPath,
+    ) -> impl Future<Output = Result<Entry, StorageError>> {
+        let _ = (data, to);
+        async { Err(read_only()) }
+    }
+    /// Uploads a finished local file (an upload link's staging file) to `to`, replacing any
+    /// file there.
+    fn put_local<'a>(
+        &'a self,
+        local: &'a Path,
+        to: &'a CheckedPath,
+    ) -> impl Future<Output = Result<Entry, StorageError>> {
+        let _ = (local, to);
+        async { Err(read_only()) }
+    }
+    fn job<'a>(&'a self, id: &'a JobId) -> impl Future<Output = Result<JobInfo, StorageError>> {
+        let _ = id;
+        async { Err(read_only()) }
+    }
+}
+
+fn read_only() -> StorageError {
+    StorageError::Unsupported("this storage backend is read-only".into())
+}
+
+impl<T: StorageWrite> StorageWrite for Arc<T> {
+    async fn mkdir(&self, path: &CheckedPath) -> Result<Entry, StorageError> {
+        (**self).mkdir(path).await
+    }
+    async fn rename(&self, from: &CheckedPath, to: &CheckedPath) -> Result<Done, StorageError> {
+        (**self).rename(from, to).await
+    }
+    async fn copy(&self, from: &CheckedPath, to: &CheckedPath) -> Result<Done, StorageError> {
+        (**self).copy(from, to).await
+    }
+    async fn trash(&self, path: &CheckedPath) -> Result<Done, StorageError> {
+        (**self).trash(path).await
+    }
+    async fn put_bytes(&self, data: Bytes, to: &CheckedPath) -> Result<Entry, StorageError> {
+        (**self).put_bytes(data, to).await
+    }
+    async fn put_local(&self, local: &Path, to: &CheckedPath) -> Result<Entry, StorageError> {
+        (**self).put_local(local, to).await
+    }
+    async fn job(&self, id: &JobId) -> Result<JobInfo, StorageError> {
+        (**self).job(id).await
     }
 }
 

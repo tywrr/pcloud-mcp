@@ -19,10 +19,12 @@ use serde_json::{Map, Value, json};
 use crate::health::Health;
 use crate::http::{HttpRequest, HttpResponse};
 use crate::index::Index;
+use crate::links::LinkSettings;
 use crate::policy::Policy;
 use crate::scope::Scopes;
-use crate::storage::{ByteRange, Storage, read_capped};
-use crate::tools::{self, Called};
+use crate::state::StateStore;
+use crate::storage::{ByteRange, StorageWrite, read_capped};
+use crate::tools::{self, Called, Parts};
 
 /// Limits and identity. Build with struct-update syntax over [`ServerConfig::default`].
 #[derive(Debug, Clone)]
@@ -51,7 +53,15 @@ pub struct ServerConfig {
     /// How long `initialize` waits for the guide before answering without it, so a backend
     /// that doesn't answer can't hold up the handshake.
     pub guide_timeout: Duration,
+    /// The write tools this server offers (to clients granted `files:write`); empty makes it
+    /// read-only. Writes also need a state database.
+    pub write_tools: Vec<String>,
+    /// Largest file `write_file` takes inline; bigger ones go through an upload link.
+    pub max_inline_bytes: u64,
 }
+
+/// Every write tool, the default for [`ServerConfig::write_tools`].
+pub const WRITE_TOOLS: &[&str] = &["create_folder", "move", "copy", "write_file", "delete"];
 
 /// Claude's web origins, allowed by default.
 pub const CLAUDE_ORIGINS: &[&str] = &["https://claude.ai", "https://claude.com"];
@@ -75,6 +85,8 @@ impl Default for ServerConfig {
             allowed_origins: CLAUDE_ORIGINS.iter().map(|&o| o.to_owned()).collect(),
             deadline: Duration::from_secs(180),
             guide_timeout: Duration::from_millis(1500),
+            write_tools: WRITE_TOOLS.iter().map(|&t| t.to_owned()).collect(),
+            max_inline_bytes: 5_000_000,
         }
     }
 }
@@ -110,7 +122,7 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 /// change with a new deployment.
 const LIST_TTL_MS: u64 = 60 * 60 * 1000;
 
-const INSTRUCTIONS: &str = "Read-only access to the owner's pCloud drive. Paths start at its \
+const INSTRUCTIONS: &str = "Access to the owner's pCloud drive. Paths start at its \
 root \"/\" (for example \"/Notes/todo.md\"). \
 list_folder shows long folders in pages: call again with the cursor it gives. \
 Find a path with search_files or list_folder before reading it. \
@@ -128,6 +140,26 @@ it is. For storage questions (\"where did my space go\", largest files, duplicat
 changed) start with folder_stats or query_files rather than listing folder by folder. \
 list_folder with live=true and get_file_info ask the drive itself. index_status shows walks \
 and problems; refresh_index re-walks after changes made elsewhere.";
+
+const WRITE_INSTRUCTIONS: &str = " \
+This connection may change the drive: create_folder, move, copy, write_file and delete (to \
+pCloud's trash, restorable there). The owner confirms each call. Folder moves, copies and \
+deletes run as jobs: they return a job id, and job_status says when they are done. Folders the \
+owner made read-only refuse every change, including moves and copies into or out of them.";
+
+const LINK_INSTRUCTIONS: &str = " \
+For files too big for a tool result, create_download_link makes an expiring HTTPS link (15 \
+minutes by default) that a computer can fetch with curl, a single file resumable with \
+curl -C -, or a folder as one streamed zip; create_upload_link makes one for sending a big file \
+in parts. list_links shows each link's use; revoke_link ends one.";
+
+/// Who is calling: what the auth Worker vouched for.
+#[derive(Debug, Clone, Default)]
+pub struct Caller {
+    pub scopes: Scopes,
+    /// The Worker's public origin, from its `X-CoF-Public-Url` header.
+    pub public_url: Option<String>,
+}
 
 /// Which protocol rules a request follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,15 +239,17 @@ impl Reply {
     }
 }
 
-pub struct McpServer<S: Storage> {
+pub struct McpServer<S: StorageWrite> {
     storage: S,
     config: ServerConfig,
     policy: Policy,
     index: Option<Arc<dyn Index>>,
     health: Arc<Health>,
+    state: Option<Arc<dyn StateStore>>,
+    links: Option<LinkSettings>,
 }
 
-impl<S: Storage> McpServer<S> {
+impl<S: StorageWrite> McpServer<S> {
     /// A server with nothing hidden; see [`McpServer::with_policy`].
     pub fn new(storage: S, config: ServerConfig) -> Self {
         Self {
@@ -224,6 +258,37 @@ impl<S: Storage> McpServer<S> {
             policy: Policy::default(),
             index: None,
             health: Arc::new(Health::new()),
+            state: None,
+            links: None,
+        }
+    }
+
+    /// Keeps jobs, links and the audit log, and so offers the write tools (as configured)
+    /// and `job_status`.
+    pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Offers the link tools (with a state database).
+    pub fn with_links(mut self, links: LinkSettings) -> Self {
+        self.links = Some(links);
+        self
+    }
+
+    pub fn state(&self) -> Option<&Arc<dyn StateStore>> {
+        self.state.as_ref()
+    }
+
+    pub fn links(&self) -> Option<&LinkSettings> {
+        self.links.as_ref()
+    }
+
+    fn parts(&self) -> Parts {
+        Parts {
+            index: self.index.is_some(),
+            state: self.state.is_some(),
+            links: self.links.is_some(),
         }
     }
 
@@ -308,7 +373,11 @@ impl<S: Storage> McpServer<S> {
             return to_http(Reply::error(request_id(&msg), err));
         }
 
-        match self.dispatch(msg, req.scopes).await {
+        let caller = Caller {
+            scopes: req.scopes,
+            public_url: req.public_url.clone(),
+        };
+        match self.dispatch(msg, &caller).await {
             Some(reply) => to_http(reply),
             None => HttpResponse::empty(202),
         }
@@ -326,7 +395,20 @@ impl<S: Storage> McpServer<S> {
         msg: serde_json::Value,
         scopes: Scopes,
     ) -> Option<serde_json::Value> {
-        self.dispatch(msg, scopes).await.map(|reply| reply.body)
+        let caller = Caller {
+            scopes,
+            public_url: None,
+        };
+        self.handle_jsonrpc_as(msg, &caller).await
+    }
+
+    /// Handles one JSON-RPC message from `caller`.
+    pub async fn handle_jsonrpc_as(
+        &self,
+        msg: serde_json::Value,
+        caller: &Caller,
+    ) -> Option<serde_json::Value> {
+        self.dispatch(msg, caller).await.map(|reply| reply.body)
     }
 
     fn origin_allowed(&self, origin: &str) -> bool {
@@ -339,7 +421,7 @@ impl<S: Storage> McpServer<S> {
         })
     }
 
-    async fn dispatch(&self, msg: Value, scopes: Scopes) -> Option<Reply> {
+    async fn dispatch(&self, msg: Value, caller: &Caller) -> Option<Reply> {
         let Value::Object(msg) = msg else {
             return Some(Reply::invalid(None, "Expected a JSON-RPC message object"));
         };
@@ -350,7 +432,7 @@ impl<S: Storage> McpServer<S> {
         match (msg.get("method"), msg.get("id")) {
             (Some(Value::String(method)), Some(_)) => match id {
                 Some(id) => Some(
-                    self.handle_request(id, method, msg.get("params"), scopes)
+                    self.handle_request(id, method, msg.get("params"), caller)
                         .await,
                 ),
                 None => Some(Reply::invalid(None, "id must be a string or a number")),
@@ -374,8 +456,9 @@ impl<S: Storage> McpServer<S> {
         id: Value,
         method: &str,
         params: Option<&Value>,
-        scopes: Scopes,
+        caller: &Caller,
     ) -> Reply {
+        let scopes = caller.scopes;
         let empty = Map::new();
         let params = match params {
             None | Some(Value::Null) => &empty,
@@ -393,11 +476,11 @@ impl<S: Storage> McpServer<S> {
         };
 
         let result = match method {
-            "initialize" => self.initialize(params).await,
+            "initialize" => self.initialize(params, scopes).await,
             "ping" => Ok(json!({})),
-            "server/discover" => Ok(to_json(&self.discover().await)),
+            "server/discover" => Ok(to_json(&self.discover(scopes).await)),
             "tools/list" => Ok(self.list_tools(era, scopes)),
-            "tools/call" => self.call_tool(params, scopes).await,
+            "tools/call" => self.call_tool(params, caller).await,
             _ => {
                 let err = RpcError::new(
                     ErrorCode::METHOD_NOT_FOUND,
@@ -423,7 +506,11 @@ impl<S: Storage> McpServer<S> {
         }
     }
 
-    async fn initialize(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+    async fn initialize(
+        &self,
+        params: &Map<String, Value>,
+        scopes: Scopes,
+    ) -> Result<Value, RpcError> {
         let requested = params
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -438,24 +525,40 @@ impl<S: Storage> McpServer<S> {
         let result = InitializeResult::new(self.capabilities())
             .with_protocol_version(version)
             .with_server_info(self.implementation())
-            .with_instructions(self.instructions().await);
+            .with_instructions(self.instructions(scopes).await);
         Ok(to_json(&result))
     }
 
-    async fn discover(&self) -> DiscoverResult {
+    async fn discover(&self, scopes: Scopes) -> DiscoverResult {
         let mut result = DiscoverResult::new(SUPPORTED_VERSIONS.to_vec(), self.capabilities())
             .with_ttl_ms(LIST_TTL_MS)
             .with_cache_scope(CacheScope::Private)
             .with_server_info(self.implementation());
-        result.instructions = Some(self.instructions().await);
+        result.instructions = Some(self.instructions(scopes).await);
         result
     }
 
-    /// The fixed instructions, the folders search skips, and the owner's guide if there is one.
-    async fn instructions(&self) -> String {
+    /// The fixed instructions, what this connection may change, the folders search skips and
+    /// the read-only folders, and the owner's guide if there is one.
+    async fn instructions(&self, scopes: Scopes) -> String {
         let mut text = String::from(INSTRUCTIONS);
         if self.index.is_some() {
             text.push_str(INDEX_INSTRUCTIONS);
+        }
+        let parts = self.parts();
+        if tools::can_write(&self.config, scopes, parts) {
+            text.push_str(WRITE_INSTRUCTIONS);
+            let protected = self.policy.protected().paths();
+            if !protected.is_empty() {
+                text.push_str(" Read-only folders: ");
+                text.push_str(&protected.join(", "));
+                text.push('.');
+            }
+        } else {
+            text.push_str(" This connection can't change anything on the drive.");
+        }
+        if parts.state && parts.links {
+            text.push_str(LINK_INSTRUCTIONS);
         }
         let skipped = self.policy.search_skip().paths();
         if !skipped.is_empty() {
@@ -527,7 +630,8 @@ impl<S: Storage> McpServer<S> {
         let mut result = ListToolsResult::with_all_items(tools::definitions(
             &self.config,
             scopes,
-            self.index.is_some(),
+            self.parts(),
+            self.links.as_ref(),
         ));
         if era == Era::Stateless {
             result = result
@@ -540,7 +644,7 @@ impl<S: Storage> McpServer<S> {
     async fn call_tool(
         &self,
         params: &Map<String, Value>,
-        scopes: Scopes,
+        caller: &Caller,
     ) -> Result<Value, RpcError> {
         let name = params
             .get("name")
@@ -556,14 +660,17 @@ impl<S: Storage> McpServer<S> {
                 ));
             }
         };
-        let ctx = tools::Ctx::new(
+        let mut ctx = tools::Ctx::new(
             &self.storage,
             &self.config,
             &self.policy,
             self.index.as_ref(),
             &self.health,
         );
-        match tools::call(&ctx, name, args, scopes).await {
+        ctx.state = self.state.as_ref();
+        ctx.links = self.links.as_ref();
+        ctx.public_url = caller.public_url.as_deref();
+        match tools::call(&ctx, name, args, caller.scopes).await {
             Called::Done(result) => Ok(to_json(&result)),
             Called::Unknown => Err(RpcError::invalid_params(format!("Unknown tool: {name}"))),
         }

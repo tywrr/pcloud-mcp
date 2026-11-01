@@ -6,8 +6,11 @@
 //!   OAuth grant and strips any copy a client sent.
 //! - `GET /healthz`: the process is up. No auth, no backend call.
 //! - `GET /readyz`: rclone answers `operations/about`. No auth, no details.
+//! - `/dl/<token>/<name>`, `/ul/<token>`: links (see [`links`]); the internal token too.
 
 pub mod config;
+pub mod links;
+pub mod state;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,8 +21,16 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
-use chance_of_files_core::{Health, HttpRequest, McpServer, SCOPES_HEADER, Scopes, Storage};
+use chance_of_files_core::{
+    Health, HttpRequest, McpServer, SCOPES_HEADER, Scopes, Storage, StorageWrite,
+};
 use subtle::ConstantTimeEq;
+
+use crate::links::LinkServer;
+
+/// The auth Worker's public origin (`https://chance-of-files.<sub>.workers.dev`), which link
+/// URLs start with; trusted only with the internal token.
+pub const PUBLIC_URL_HEADER: &str = "x-cof-public-url";
 
 /// How long a readiness probe waits for rclone.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,32 +77,58 @@ pub async fn health_loop<S: Storage>(storage: S, health: Arc<Health>, every: Dur
     }
 }
 
-pub struct App<S: Storage> {
+pub struct App<S: StorageWrite> {
     pub mcp: McpServer<S>,
     internal_token: String,
     max_body_bytes: usize,
+    pub links: Option<LinkServer>,
 }
 
-impl<S: Storage> App<S> {
+impl<S: StorageWrite> App<S> {
     pub fn new(mcp: McpServer<S>, internal_token: String, max_body_bytes: usize) -> Self {
         Self {
             mcp,
             internal_token,
             max_body_bytes,
+            links: None,
         }
+    }
+
+    /// Serves `/dl` and `/ul`.
+    pub fn with_links(mut self, links: LinkServer) -> Self {
+        self.links = Some(links);
+        self
+    }
+
+    /// The request carries the internal token.
+    pub fn authorized(&self, headers: &HeaderMap) -> bool {
+        bearer_matches(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            &self.internal_token,
+        )
     }
 }
 
-pub fn router<S: Storage + 'static>(app: Arc<App<S>>) -> Router {
+pub fn router<S: StorageWrite + 'static>(app: Arc<App<S>>) -> Router {
     Router::new()
         .route("/mcp", any(mcp::<S>))
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(ready::<S>))
+        .route(
+            "/dl/{*rest}",
+            any(|State(app): State<Arc<App<S>>>, request: Request| links::download(app, request)),
+        )
+        .route(
+            "/ul/{*rest}",
+            any(|State(app): State<Arc<App<S>>>, request: Request| links::upload(app, request)),
+        )
         .fallback(|| async { (StatusCode::NOT_FOUND, "not found") })
         .with_state(app)
 }
 
-async fn ready<S: Storage>(State(app): State<Arc<App<S>>>) -> Response {
+async fn ready<S: StorageWrite>(State(app): State<Arc<App<S>>>) -> Response {
     match tokio::time::timeout(READY_TIMEOUT, app.mcp.storage().health()).await {
         Ok(Ok(())) => (StatusCode::OK, "ready").into_response(),
         Ok(Err(err)) => {
@@ -105,16 +142,10 @@ async fn ready<S: Storage>(State(app): State<Arc<App<S>>>) -> Response {
     }
 }
 
-async fn mcp<S: Storage>(State(app): State<Arc<App<S>>>, request: Request) -> Response {
+async fn mcp<S: StorageWrite>(State(app): State<Arc<App<S>>>, request: Request) -> Response {
     let started = Instant::now();
     let method = request.method().clone();
-    if !bearer_matches(
-        request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-        &app.internal_token,
-    ) {
+    if !app.authorized(request.headers()) {
         tracing::warn!(%method, path = "/mcp", status = 401, "missing or wrong internal token");
         return (
             StatusCode::UNAUTHORIZED,
@@ -150,6 +181,12 @@ async fn mcp<S: Storage>(State(app): State<Arc<App<S>>>, request: Request) -> Re
             .get(SCOPES_HEADER)
             .and_then(|v| v.to_str().ok()),
     );
+    let public_url = parts
+        .headers
+        .get(PUBLIC_URL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
     let (rpc_method, tool) = describe(&body);
     let request = HttpRequest {
         method: method.as_str().to_ascii_uppercase(),
@@ -157,6 +194,7 @@ async fn mcp<S: Storage>(State(app): State<Arc<App<S>>>, request: Request) -> Re
         headers: plain_headers(&parts.headers),
         body,
         scopes,
+        public_url,
     };
     let response = app.mcp.handle_http(request).await;
     tracing::info!(

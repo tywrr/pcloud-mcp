@@ -6,6 +6,8 @@
 //   /register                                Dynamic Client Registration, from DCR_ALLOWED_CIDRS only
 //   /.well-known/oauth-authorization-server  RFC 8414 metadata
 //   /.well-known/oauth-protected-resource    RFC 9728 metadata (also at .../oauth-protected-resource/mcp)
+//   /dl/<token>/<name>, /ul/<token>          signed download and upload links; the token is the
+//                                            credential (no OAuth), forwarded to the core over CORE
 //   /healthz                                 "ok", for uptime checks
 //
 // Everything else is 404.
@@ -15,6 +17,7 @@ import { handleAuthorize } from "./authorize";
 import {
 	ACCESS_TOKEN_TTL,
 	type AppEnv,
+	FILE_SCOPES,
 	READ_SCOPE,
 	REFRESH_TOKEN_IDLE_TTL,
 	REFRESH_TOKEN_TTL,
@@ -22,6 +25,7 @@ import {
 } from "./config";
 import { forwardToCore } from "./core";
 import { CidrList } from "./ip";
+import { handleLink } from "./links";
 import { RedirectPolicy } from "./redirects";
 import { clientIp, withinLimit } from "./security";
 
@@ -52,7 +56,11 @@ function build(origin: string, redirectSpec: string | undefined): Built {
 				const ctx = executionContext as OAuthResourceContext<unknown>;
 				// Every grant carries files:read; a token without it was refreshed down to less.
 				if (!ctx.auth.scope.includes(READ_SCOPE)) return insufficientScope(ctx.auth, [READ_SCOPE]);
-				return forwardToCore(request, env, ctx.auth.scope);
+				const scopes = ctx.auth.scope.filter((scope) => FILE_SCOPES.includes(scope));
+				return forwardToCore(request, env, {
+					"X-CoF-Scopes": scopes.join(" "),
+					"X-CoF-Public-Url": origin,
+				});
 			},
 		},
 		defaultHandler: {
@@ -178,6 +186,11 @@ export default {
 
 		const origin = publicOrigin(env, url);
 		if (origin instanceof Response) return origin;
+
+		// Links never touch the OAuth library: no token, no KV.
+		if (url.pathname.startsWith("/dl/") || url.pathname.startsWith("/ul/")) {
+			return handleLink(request, env, url);
+		}
 
 		let entry: Built;
 		try {

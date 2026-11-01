@@ -12,16 +12,24 @@
 //!   checked against a fresh `stat` and the answer's `Content-Range` is checked against the
 //!   request.
 //! - Only the rc calls in [`Method`] can be sent: no `operations/cleanup` (empties the trash)
-//!   and no `operations/publiclink`.
+//!   and no `operations/publiclink`. Deletes are `deletefile` and `purge`, which pCloud puts in
+//!   its trash; other backends delete for good, so there [`Capabilities::trash_on_delete`] is
+//!   false and the core refuses deletes.
+//! - Folder moves, copies and purges are sent with `_async` and followed with `job/status`.
+//!   A folder move with no filter active is one server-side rename on pCloud.
+//! - Uploads go through a local staging folder that the rclone process can read at the same
+//!   path (`operations/copyfile` from it): pCloud has no streaming upload, so rclone would
+//!   otherwise spool every upload to its own small temp folder first.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use base64::Engine as _;
 use bytes::Bytes;
 use chance_of_files_core::{
-    ByteRange, ByteStream, Capabilities, CheckedPath, Entry, HashKind, PathSet, Storage,
-    StorageError, split_walk_each,
+    ByteRange, ByteStream, Capabilities, CheckedPath, Done, Entry, HashKind, JobId, JobInfo,
+    JobState, PathSet, Storage, StorageError, StorageWrite, split_walk_each, time,
 };
 use futures_util::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -38,10 +46,36 @@ pub enum Method {
     Stat,
     About,
     FsInfo,
+    Mkdir,
+    MoveFile,
+    CopyFile,
+    /// To pCloud's trash (pCloud's own `deletefile`).
+    DeleteFile,
+    /// A folder to pCloud's trash (`deletefolderrecursive`).
+    Purge,
+    SyncMove,
+    SyncCopy,
+    JobStatus,
+    /// Progress of one job (`group: job/<id>`).
+    Stats,
 }
 
 impl Method {
-    pub const ALL: [Self; 4] = [Self::List, Self::Stat, Self::About, Self::FsInfo];
+    pub const ALL: [Self; 13] = [
+        Self::List,
+        Self::Stat,
+        Self::About,
+        Self::FsInfo,
+        Self::Mkdir,
+        Self::MoveFile,
+        Self::CopyFile,
+        Self::DeleteFile,
+        Self::Purge,
+        Self::SyncMove,
+        Self::SyncCopy,
+        Self::JobStatus,
+        Self::Stats,
+    ];
 
     pub fn path(self) -> &'static str {
         match self {
@@ -49,6 +83,15 @@ impl Method {
             Self::Stat => "operations/stat",
             Self::About => "operations/about",
             Self::FsInfo => "operations/fsinfo",
+            Self::Mkdir => "operations/mkdir",
+            Self::MoveFile => "operations/movefile",
+            Self::CopyFile => "operations/copyfile",
+            Self::DeleteFile => "operations/deletefile",
+            Self::Purge => "operations/purge",
+            Self::SyncMove => "sync/move",
+            Self::SyncCopy => "sync/copy",
+            Self::JobStatus => "job/status",
+            Self::Stats => "core/stats",
         }
     }
 }
@@ -65,6 +108,9 @@ pub struct RcloneConfig {
     pub remote: String,
     /// Most bytes of one rc answer taken in (a recursive listing of 133k entries is 35 MB).
     pub max_listing_bytes: u64,
+    /// A local folder both this process and rclone see at this same path, for uploads. Without
+    /// it, `put_bytes` and `put_local` are refused.
+    pub staging: Option<PathBuf>,
 }
 
 impl fmt::Debug for RcloneConfig {
@@ -74,6 +120,7 @@ impl fmt::Debug for RcloneConfig {
             .field("user", &self.user)
             .field("remote", &self.remote)
             .field("max_listing_bytes", &self.max_listing_bytes)
+            .field("staging", &self.staging)
             .finish_non_exhaustive()
     }
 }
@@ -88,6 +135,7 @@ pub struct RcloneStorage {
     /// The rc-serve URL prefix for this remote, `<base>/[pcloud:]`.
     serve_prefix: String,
     max_listing_bytes: u64,
+    staging: Option<PathBuf>,
     capabilities: OnceLock<Capabilities>,
 }
 
@@ -156,6 +204,15 @@ impl RcloneStorage {
         let mut authorization = HeaderValue::from_str(&format!("Basic {credentials}"))
             .map_err(|_| "rclone user or password has characters a header can't carry")?;
         authorization.set_sensitive(true);
+        if let Some(staging) = &config.staging {
+            let text = staging.to_string_lossy();
+            // rclone reads "x:y" as remote x; a staging path must stay a local path.
+            if !staging.is_absolute() || text.contains(':') || text.contains(',') {
+                return Err(format!(
+                    "the staging folder {text:?} must be an absolute path without ':' or ','"
+                ));
+            }
+        }
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             // Loopback: a proxy from the environment must never see the rc password.
@@ -169,6 +226,7 @@ impl RcloneStorage {
             fs,
             serve_prefix,
             max_listing_bytes: config.max_listing_bytes,
+            staging: config.staging,
             capabilities: OnceLock::new(),
         })
     }
@@ -186,8 +244,9 @@ impl RcloneStorage {
         }
         let info: FsInfo = self.rc(Method::FsInfo, json!({"fs": self.fs}), "/").await?;
         let capabilities = Capabilities {
-            // Decided per backend when writes arrive (phase 3); nothing deletes yet.
-            trash_on_delete: false,
+            // pCloud's deletefile and deletefolderrecursive land in its trash (the owner
+            // checked, phase 0); every other backend's deletes are final.
+            trash_on_delete: info.string.to_ascii_lowercase().starts_with("pcloud "),
             hashes: info
                 .hashes
                 .iter()
@@ -557,6 +616,229 @@ impl Storage for RcloneStorage {
     }
 }
 
+impl RcloneStorage {
+    /// The remote rooted at `path` (`pcloud:a/b`), for `sync/*` calls on folders.
+    fn fs_at(&self, path: &CheckedPath) -> String {
+        format!("{}{}", self.fs, path.relative())
+    }
+
+    /// Sends a call with `_async` and returns rclone's job id.
+    async fn start_job(
+        &self,
+        method: Method,
+        mut body: Value,
+        path: &str,
+    ) -> Result<JobId, StorageError> {
+        body["_async"] = json!(true);
+        let answer: Value = self.rc(method, body, path).await?;
+        answer
+            .get("jobid")
+            .and_then(Value::as_i64)
+            .map(|id| JobId(id.to_string()))
+            .ok_or_else(|| {
+                StorageError::Backend(format!("rclone {} returned no job id", method.path()))
+            })
+    }
+
+    /// The staging folder, or why uploads can't work.
+    fn staging(&self) -> Result<&Path, StorageError> {
+        self.staging.as_deref().ok_or_else(|| {
+            StorageError::Unsupported("uploads need a staging folder rclone can read".into())
+        })
+    }
+
+    async fn progress(&self, jobid: i64) -> Option<String> {
+        let stats: Value = self
+            .rc(
+                Method::Stats,
+                json!({"group": format!("job/{jobid}")}),
+                "job",
+            )
+            .await
+            .ok()?;
+        let n = |key: &str| stats.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let (bytes, total) = (n("bytes"), n("totalBytes"));
+        let (files, all) = (n("transfers"), n("totalTransfers"));
+        if total == 0 && all == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} of {}, {files} of {all} files",
+            mib(bytes),
+            mib(total.max(bytes))
+        ))
+    }
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+impl StorageWrite for RcloneStorage {
+    async fn mkdir(&self, path: &CheckedPath) -> Result<Entry, StorageError> {
+        let body = json!({"fs": self.fs, "remote": path.relative()});
+        let _: Value = self.rc(Method::Mkdir, body, path.as_str()).await?;
+        self.stat(path, false).await
+    }
+
+    async fn rename(&self, from: &CheckedPath, to: &CheckedPath) -> Result<Done, StorageError> {
+        let source = self.stat(from, false).await?;
+        if source.is_dir {
+            // No filter is ever active, so rclone tries pCloud's one-call folder rename first.
+            let body = json!({
+                "srcFs": self.fs_at(from),
+                "dstFs": self.fs_at(to),
+                "deleteEmptySrcDirs": true,
+                "createEmptySrcDirs": true,
+            });
+            return Ok(Done::Job(
+                self.start_job(Method::SyncMove, body, from.as_str())
+                    .await?,
+            ));
+        }
+        let body = json!({
+            "srcFs": self.fs, "srcRemote": from.relative(),
+            "dstFs": self.fs, "dstRemote": to.relative(),
+        });
+        let _: Value = self.rc(Method::MoveFile, body, from.as_str()).await?;
+        Ok(Done::Now(self.stat(to, false).await?))
+    }
+
+    async fn copy(&self, from: &CheckedPath, to: &CheckedPath) -> Result<Done, StorageError> {
+        let source = self.stat(from, false).await?;
+        if source.is_dir {
+            let body = json!({
+                "srcFs": self.fs_at(from),
+                "dstFs": self.fs_at(to),
+                "createEmptySrcDirs": true,
+            });
+            return Ok(Done::Job(
+                self.start_job(Method::SyncCopy, body, from.as_str())
+                    .await?,
+            ));
+        }
+        let body = json!({
+            "srcFs": self.fs, "srcRemote": from.relative(),
+            "dstFs": self.fs, "dstRemote": to.relative(),
+        });
+        let _: Value = self.rc(Method::CopyFile, body, from.as_str()).await?;
+        Ok(Done::Now(self.stat(to, false).await?))
+    }
+
+    async fn trash(&self, path: &CheckedPath) -> Result<Done, StorageError> {
+        if !self.capabilities().trash_on_delete {
+            return Err(StorageError::Unsupported(
+                "this remote has no trash, and nothing here deletes for good".into(),
+            ));
+        }
+        let entry = self.stat(path, false).await?;
+        let body = json!({"fs": self.fs, "remote": path.relative()});
+        if entry.is_dir {
+            return Ok(Done::Job(
+                self.start_job(Method::Purge, body, path.as_str()).await?,
+            ));
+        }
+        let _: Value = self.rc(Method::DeleteFile, body, path.as_str()).await?;
+        Ok(Done::Now(entry))
+    }
+
+    async fn put_bytes(&self, data: Bytes, to: &CheckedPath) -> Result<Entry, StorageError> {
+        let staging = self.staging()?.to_owned();
+        let name = format!(
+            ".put-{}",
+            chance_of_files_core::links::random_bytes::<8>()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let local = staging.join(name);
+        let file = local.clone();
+        tokio::task::spawn_blocking(move || std::fs::write(&file, &data))
+            .await
+            .map_err(|e| StorageError::Backend(format!("staging write failed: {e}")))?
+            .map_err(|e| StorageError::Backend(format!("can't write the staging file: {e}")))?;
+        let result = self.put_local(&local, to).await;
+        let _ = std::fs::remove_file(&local);
+        result
+    }
+
+    async fn put_local(&self, local: &Path, to: &CheckedPath) -> Result<Entry, StorageError> {
+        let staging = self.staging()?;
+        // Only files directly in the staging folder: rclone can read any local path, so the
+        // source is never anything a caller chose.
+        let name = local
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|_| local.parent() == Some(staging))
+            .ok_or_else(|| {
+                StorageError::InvalidPath("uploads come only from the staging folder".into())
+            })?;
+        let body = json!({
+            "srcFs": staging.to_string_lossy(), "srcRemote": name,
+            "dstFs": self.fs, "dstRemote": to.relative(),
+        });
+        let _: Value = self.rc(Method::CopyFile, body, to.as_str()).await?;
+        self.stat(to, false).await
+    }
+
+    async fn job(&self, id: &JobId) -> Result<JobInfo, StorageError> {
+        let jobid: i64 =
+            id.0.parse()
+                .map_err(|_| StorageError::InvalidPath(format!("{id} is not an rclone job id")))?;
+        let response = self
+            .send(Method::JobStatus, json!({"jobid": jobid}))
+            .await?;
+        let status = response.status();
+        let body = self.read_body(response, "job").await?;
+        if !status.is_success() {
+            if String::from_utf8_lossy(&body).contains("job not found") {
+                return Ok(JobInfo {
+                    state: JobState::Lost,
+                    started: None,
+                    progress: None,
+                });
+            }
+            return Err(rc_error(Method::JobStatus, status, &body, "job"));
+        }
+        let answer: JobAnswer = serde_json::from_slice(&body).map_err(|e| {
+            StorageError::Backend(format!("rclone job/status answered unexpected JSON: {e}"))
+        })?;
+        let started = answer.start_time.as_deref().and_then(time::parse_rfc3339);
+        let state = match (answer.finished, answer.success) {
+            (false, _) => JobState::Running,
+            (true, true) => JobState::Done,
+            (true, false) => JobState::Failed(if answer.error.is_empty() {
+                "rclone reported a failure without a message".into()
+            } else {
+                answer.error.chars().take(500).collect()
+            }),
+        };
+        let progress = if state == JobState::Running {
+            self.progress(jobid).await
+        } else {
+            None
+        };
+        Ok(JobInfo {
+            state,
+            started,
+            progress,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobAnswer {
+    #[serde(default)]
+    finished: bool,
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    start_time: Option<String>,
+}
+
 /// Why the body pump stopped feeding the parser.
 #[derive(Debug)]
 enum Pump {
@@ -813,6 +1095,9 @@ struct Stat {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct FsInfo {
+    /// e.g. `pcloud root ''`: the backend type comes first.
+    #[serde(default)]
+    string: String,
     #[serde(default)]
     hashes: Vec<String>,
     #[serde(default)]
@@ -835,14 +1120,24 @@ mod tests {
     fn only_harmless_methods_exist() {
         for method in Method::ALL {
             let path = method.path();
-            assert!(path.starts_with("operations/"), "{path}");
+            assert!(
+                ["operations/", "sync/", "job/status", "core/stats"]
+                    .iter()
+                    .any(|p| path.starts_with(p)),
+                "{path}"
+            );
+            // Emptying the trash, public links, two-way sync, config and process control
+            // can't be sent at all.
             for forbidden in [
                 "cleanup",
                 "publiclink",
-                "delete",
-                "purge",
-                "core/",
+                "rmdirs",
+                "bisync",
                 "config/",
+                "core/command",
+                "core/quit",
+                "backend/",
+                "job/stop",
             ] {
                 assert!(!path.contains(forbidden), "{path}");
             }
@@ -929,6 +1224,7 @@ mod tests {
             password: "pw".into(),
             remote: remote.into(),
             max_listing_bytes: 1000,
+            staging: None,
         }
     }
 

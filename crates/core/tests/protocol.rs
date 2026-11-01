@@ -378,6 +378,9 @@ fn a_long_guide_is_cut_at_8_kib_on_a_character_boundary() {
 /// A backend that never answers a read.
 struct HangingStorage;
 
+/// Read-only.
+impl chance_of_files_core::StorageWrite for HangingStorage {}
+
 impl chance_of_files_core::Storage for HangingStorage {
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()

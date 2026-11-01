@@ -23,6 +23,9 @@ struct Fake {
     broken: AtomicBool,
 }
 
+/// Read-only.
+impl chance_of_files_core::StorageWrite for Fake {}
+
 impl Storage for Fake {
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()

@@ -15,6 +15,9 @@
 //                     requests that carry it, so Claude's own access tokens never reach it.
 //   OWNER_PASSPHRASE  what you type on the sign-in page. Use a long random one, for example
 //                     the output of `openssl rand -base64 24`; anyone who knows it can connect.
+//   LINK_KEY          the same value as the core's LINK_KEY: the HMAC key of /dl and /ul links.
+//                     32+ characters, e.g. `openssl rand -base64 32`. Changing it on both sides
+//                     revokes every link.
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "chance-of-files",
@@ -56,7 +59,7 @@
 	// Wrangler refuses to deploy without these, and warns in `wrangler dev` when .dev.vars lacks
 	// them. A brand-new Worker can't have secrets yet, so the first deploy passes them in a file:
 	// `npx wrangler deploy --secrets-file .secrets` (see README.md).
-	"secrets": { "required": ["INTERNAL_TOKEN", "OWNER_PASSPHRASE"] },
+	"secrets": { "required": ["INTERNAL_TOKEN", "OWNER_PASSPHRASE", "LINK_KEY"] },
 	// Clients, grants and tokens (tokens are stored only as hashes). With no "id", wrangler
 	// creates the namespace on the first deploy and keeps it linked.
 	"kv_namespaces": [{ "binding": "OAUTH_KV" }],
@@ -85,6 +88,13 @@
 			"name": "SIGNIN_LIMITER",
 			"namespace_id": "73102",
 			"simple": { "limit": 20, "period": 60 }
+		},
+		{
+			// Requests to /dl and /ul links, valid or not: a resumed download or a 90 MiB upload part
+			// is one request, so this only bites on floods.
+			"name": "LINK_LIMITER",
+			"namespace_id": "73103",
+			"simple": { "limit": 60, "period": 60 }
 		}
 	],
 	"dev": { "port": 8788 }

@@ -13,6 +13,9 @@
 #     internal-token   the auth Worker's INTERNAL_TOKEN; made here if missing (set the same value
 #                      on the Worker: docs/setup.md)
 #     rc-pass          rclone's rc password, used only inside the pod; made here if missing
+#     link-key         signs download/upload links; made here if missing (set the same value as
+#                      the auth Worker's LINK_KEY secret: docs/setup.md). A Secret made before 0.4
+#                      gets it added, and the pod restarts to pick it up.
 #   $RCLONE_REMOTE (default chance-of-files): an authorised rclone pcloud remote on this machine
 #     (`rclone config create chance-of-files pcloud`); its token and API host go into the Secret.
 #
@@ -36,7 +39,7 @@ if [ -n "${COF_EXPECT_NODE:-}" ]; then
 fi
 
 [ -s "$secrets/tunnel-token" ] || { echo "missing $secrets/tunnel-token" >&2; exit 1; }
-for f in internal-token rc-pass; do
+for f in internal-token rc-pass link-key; do
   if [ ! -s "$secrets/$f" ]; then
     (umask 077 && openssl rand -hex 32 | tr -d '\n' >"$secrets/$f")
     echo "made $secrets/$f"
@@ -63,6 +66,7 @@ if ! k get secret chance-of-files >/dev/null 2>&1; then
   k create secret generic chance-of-files \
     --from-file=internal-token=<(tr -d '\n' <"$secrets/internal-token") \
     --from-file=rc-pass=<(tr -d '\n' <"$secrets/rc-pass") \
+    --from-file=link-key=<(tr -d '\n' <"$secrets/link-key") \
     --from-file=pcloud-token=<(printf %s "$tok") \
     --from-file=pcloud-hostname=<(printf %s "$host") \
     --from-file=tunnel-token=<(tr -d '\n' <"$secrets/tunnel-token")
@@ -70,9 +74,23 @@ if ! k get secret chance-of-files >/dev/null 2>&1; then
   created=1
 fi
 
+# A Secret from before 0.4 has no link-key: add it from the file (through a patch file, so the
+# value never appears in a command line).
+added=0
+if [ "$created" = 0 ] && [ -z "$(k get secret chance-of-files -o jsonpath='{.data.link-key}')" ]; then
+  patch=$(mktemp)
+  trap 'rm -f "$patch"' EXIT
+  chmod 600 "$patch"
+  printf '{"data":{"link-key":"%s"}}' "$(tr -d '\n' <"$secrets/link-key" | base64 -w0)" >"$patch"
+  k patch secret chance-of-files --type=merge --patch-file "$patch" >/dev/null
+  rm -f "$patch"
+  echo "added link-key to the Secret"
+  added=1
+fi
+
 kubectl apply -k "$dir"
-# A pod that started before a new Secret existed keeps the old env until it restarts.
-if [ "$rotate" = 1 ] && [ "$created" = 1 ]; then
+# A pod that started before a new Secret (or key) existed keeps the old env until it restarts.
+if { [ "$rotate" = 1 ] && [ "$created" = 1 ]; } || [ "$added" = 1 ]; then
   k rollout restart deploy/chance-of-files
 fi
 k rollout status deploy/chance-of-files --timeout=300s

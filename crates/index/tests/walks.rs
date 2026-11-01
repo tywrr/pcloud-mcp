@@ -535,12 +535,13 @@ async fn an_interrupted_walk_is_retried_after_the_first_back_off() {
         let due = f.index.roots().unwrap()[0].next_due.unwrap();
         assert!(due >= now + 1700, "{due} vs {now}");
         // ...but this one starts and the process stops before it is applied.
-        f.index.db().walk_starting("/", now + 1).unwrap();
+        // Well after the finished walk, even if that one ended a second or two after `now`.
+        f.index.db().walk_starting("/", now + 10).unwrap();
     }
     let f = common::open_in(dir, tree, &["/"], no_policy());
     let due = f.index.roots().unwrap()[0].next_due.unwrap();
     // Two minutes after the interrupted start: not at once, not half an hour later.
-    assert_eq!(due, now + 1 + 120, "due in {} s", due - now);
+    assert_eq!(due, now + 10 + 120, "due in {} s", due - now);
 }
 
 #[tokio::test]
@@ -606,4 +607,47 @@ async fn own_writes_and_deletes_in_the_same_second_as_the_walk_start_win() {
     .unwrap();
     assert!(f.index.entry("/Docs/written.txt").unwrap().is_some());
     assert!(f.index.entry("/Docs/b.txt").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn write_through_from_the_tools_side() {
+    let f = open(sample(), &["/", "/Photos"], no_policy());
+    f.walk("/").await;
+    f.walk("/Photos").await;
+    let index: &dyn Index = &*f.index;
+
+    // A confirmed write shows at once, in the root that holds it, logged as our own.
+    index
+        .record_write(&chance_of_files_core::Entry {
+            path: "/Photos/2024/z.jpg".into(),
+            name: "z.jpg".into(),
+            size: Some(7),
+            modified: Some("2026-10-31T10:00:00Z".into()),
+            id: Some("f77".into()),
+            ..chance_of_files_core::Entry::default()
+        })
+        .unwrap();
+    let z = index.entry("/photos/2024/z.jpg").unwrap().unwrap();
+    assert_eq!((z.size, z.remote_id.as_deref()), (Some(7), Some("f77")));
+    let changes = index.changes("/", 0, Some("own-write"), None, 10).unwrap();
+    assert_eq!(changes[0].path, "/Photos/2024/z.jpg");
+
+    // A delete takes the folder and everything under it away, whatever case it was asked in.
+    index.record_delete("/docs/OLD").unwrap();
+    assert!(index.entry("/Docs/old/c.docx").unwrap().is_none());
+    assert!(index.entry("/Docs/old").unwrap().is_none());
+    // Unknown paths are no error.
+    index.record_delete("/nowhere").unwrap();
+
+    // A re-walk after a job queues a walk of that folder; the next walk brings what the
+    // drive has.
+    f.tree.file("/Docs/new.txt", 4);
+    index.rewalk("/Docs").unwrap();
+    let status = index.roots().unwrap();
+    assert!(
+        status.iter().any(|r| r.path == "/" && r.queued),
+        "{status:?}"
+    );
+    f.walk_at("/", "/Docs").await;
+    assert!(index.entry("/Docs/new.txt").unwrap().is_some());
 }

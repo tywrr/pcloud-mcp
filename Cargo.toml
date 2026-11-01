@@ -7,7 +7,7 @@ members = ["crates/core", "crates/index", "crates/rclone", "crates/server"]
 exclude = ["spikes", "crates/webdav"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tywrr/chance-of-files"
@@ -20,17 +20,24 @@ chance-of-files-rclone = { path = "crates/rclone" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
+crc32fast = "1.5.3"
+getrandom = "0.4.3"
+hmac = "0.13.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 http-body-util = "0.1.5"
 percent-encoding = "2.3.2"
 # Plain HTTP only: the rclone rc API is on loopback, and leaving TLS out keeps OpenSSL and
 # aws-lc (C toolchains) out of the static musl build.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+# Bundled: one SQLite version everywhere, including the static musl build.
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "cache"] }
 # Only the protocol types: the core keeps its own stateless endpoint (design D1).
 rmcp = { version = "3.8.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.149"
-# Constant-time comparison of the internal bearer token.
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+# Constant-time comparison of the internal bearer token and of link MACs.
 subtle = "2.6.1"
 tokio = { version = "1.54.1", features = ["time"] }
 trait-variant = "0.1.2"
